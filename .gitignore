@@ -1,0 +1,10 @@
+﻿################################################################################
+# This .gitignore file was automatically created by Microsoft(R) Visual Studio.
+################################################################################
+
+/.vs/SqlServerLib/FileContentIndex
+/.vs/SqlServerLib/v17
+/bin/Debug/net9.0
+/obj
+/.vs/SqlServerLib
+/.vs/ProjectEvaluation
