@@ -104,6 +104,14 @@ namespace mySalesforce {
 			return sql.ToString();
 		}
 
+		public List<string> GetChangeEventUrls(DataTable sfoTables) {
+			
+			return sfoTables.AsEnumerable()
+				.Select(row => $"/data/{row["name"]}ChangeEvent")
+				//.Where(name => name.EndsWith("__e", StringComparison.OrdinalIgnoreCase))
+				.OrderBy(name => name)
+				.ToList();
+		}
 
 
 		private static string mapToSqlType(string salesforceType, int length, string columnName) {
