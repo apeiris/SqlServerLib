@@ -14,13 +14,13 @@ namespace mySalesforce {
 		private readonly string? _connectionString;
 		private readonly ILogger<SqlServerLib> _l;
 		public event EventHandler<SqlEventArg> SqlEvent;
-		public event EventHandler<SqlObjectExist> SqlObjectExist;
+		public event EventHandler<SqlObjectQuery> SqlObjectExist;
 		private void RaisSqlEvent(string message, LogLevel ll, [CallerMemberName] string callerMemberName = "", [CallerLineNumber] int callerLineNumber = 0) {
 			message = $"{message}:{callerMemberName}:{callerLineNumber}";
 			SqlEvent?.Invoke(this, new SqlEventArg(message, ll));
 		}
-		private void RaisSqlObjectExist(int objectId , string objectName,string objectType,bool exists,string query ) {
-			SqlObjectExist?.Invoke(this, new SqlObjectExist(objectName, objectType, objectId, exists, query));
+		private void RaisSqlObjectExist(int objectId, string objectName, string objectType, bool exists, string query) {
+			SqlObjectExist?.Invoke(this, new SqlObjectQuery(objectName, objectType, objectId, exists, query));
 		}
 
 		public SqlServerLib(IConfiguration configuration, ILogger<SqlServerLib> logger) {
@@ -34,7 +34,7 @@ namespace mySalesforce {
 		}
 		#endregion SqlServerLib.ctor
 		#region Public Methods
-		public DataTable GetAll_sfoTables() {
+		public DataTable GetAll_sfoTables() /* gets all tables in sfo schema*/ {
 			DataTable dataTable = new DataTable();
 			try {
 				using (SqlConnection connection = new SqlConnection(_connectionString)) {
@@ -58,6 +58,26 @@ namespace mySalesforce {
 				throw;
 			}
 			RaisSqlEvent($"{dataTable.Rows.Count} rows", LogLevel.Debug);
+			return dataTable;
+		}
+		public DataTable Select(string sql, string primaryKey = "Id") {
+			DataTable dataTable = new DataTable();
+			try {
+				using (SqlConnection connection = new SqlConnection(_connectionString)) {
+					connection.Open();
+					using (SqlCommand command = new SqlCommand(sql, connection)) {
+						using (SqlDataAdapter adapter = new SqlDataAdapter(command)) {
+							adapter.Fill(dataTable);
+						}
+					}
+				}
+			} catch (SqlException ex) {
+				RaisSqlEvent($"SQL Error:{ex.Message}", LogLevel.Error);
+				throw;
+			} catch (Exception ex) {
+				RaisSqlEvent($"Error:{ex.Message}", LogLevel.Error);
+				throw;
+			}
 			return dataTable;
 		}
 		public void ExecuteNoneQuery(string script) {
@@ -144,7 +164,6 @@ namespace mySalesforce {
 
 			throw new Exception("No results returned from stored procedure.");
 		}
-
 		public void AssertCDCObjectExist(string objectName) {
 			using (SqlConnection conn = new SqlConnection(_connectionString)) {
 				conn.Open();
@@ -158,6 +177,27 @@ namespace mySalesforce {
 
 		}
 
+		public DataTable GetModified(DataTable dt) {
+			DataTable mDt = dt.Clone();
+			mDt.TableName = dt.TableName;
+			DataRow[] mRows = dt.Select("", "", DataViewRowState.ModifiedCurrent);
+			mDt.BeginLoadData();
+		
+			mRows
+					 .Select(row => {
+						 // Create array of values using LINQ: copy original values as-is
+						 object[] values = dt.Columns
+							 .Cast<DataColumn>()
+							 .Select(col => row[col.ColumnName])
+							// .Concat(new object[] { null }) // Append null for ModificationTime
+							 .ToArray();
+						 return mDt.LoadDataRow(values, false);
+					 })
+			.ToList(); // Execute the query
+			mDt.EndLoadData();
+
+			return mDt;
+		}
 
 
 		#region helpers (private)
@@ -198,6 +238,7 @@ namespace mySalesforce {
 	}
 	#endregion	Public Methods
 }
+#region event args
 public class SqlEventArg : EventArgs {
 	public LogLevel LogLevel { get; }
 	public string Message { get; }
@@ -206,14 +247,14 @@ public class SqlEventArg : EventArgs {
 		Message = message;
 	}
 }
-public class SqlObjectExist : EventArgs {
+public class SqlObjectQuery : EventArgs {
 	public LogLevel Loglevel { get; }
 	public string ObjectName { get; }
 	public string ObjectType { get; }
 	public bool Exist { get; }
 	public string Query { get; }
 	public int Id { get; }
-	public SqlObjectExist(string objectName, string objectType, int id, bool exist, string query) {
+	public SqlObjectQuery(string objectName, string objectType, int id, bool exist, string query) {
 		ObjectName = objectName;
 		ObjectType = objectType;
 		Exist = exist;
@@ -222,6 +263,7 @@ public class SqlObjectExist : EventArgs {
 		Id = id;// row id when exist -1 otherwise
 	}
 }
+#endregion event args
 #region Extensions
 public static class SqlServerLibExtensions {
 	public static void AddIdentityColumn(this DataTable table,
