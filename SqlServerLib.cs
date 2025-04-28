@@ -1,4 +1,5 @@
-﻿using Microsoft.Data.SqlClient;
+﻿using Azure.Core.GeoJson;
+using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using System;
@@ -13,10 +14,15 @@ namespace mySalesforce {
 		private readonly string? _connectionString;
 		private readonly ILogger<SqlServerLib> _l;
 		public event EventHandler<SqlEventArg> SqlEvent;
+		public event EventHandler<SqlObjectExist> SqlObjectExist;
 		private void RaisSqlEvent(string message, LogLevel ll, [CallerMemberName] string callerMemberName = "", [CallerLineNumber] int callerLineNumber = 0) {
 			message = $"{message}:{callerMemberName}:{callerLineNumber}";
 			SqlEvent?.Invoke(this, new SqlEventArg(message, ll));
 		}
+		private void RaisSqlObjectExist(int objectId , string objectName,string objectType,bool exists,string query ) {
+			SqlObjectExist?.Invoke(this, new SqlObjectExist(objectName, objectType, objectId, exists, query));
+		}
+
 		public SqlServerLib(IConfiguration configuration, ILogger<SqlServerLib> logger) {
 			if (configuration == null)
 				throw new ArgumentNullException(nameof(configuration));
@@ -67,10 +73,11 @@ namespace mySalesforce {
 				RaisSqlEvent($"Error:{ex.Message}", LogLevel.Error);
 			}
 		}
-		public string GenerateCreateTableScript(DataTable schema,string schemaName, string tableName) {
+		//public void Table
+		public string GenerateCreateTableScript(DataTable schema, string schemaName, string tableName) {
 			StringBuilder sql = new StringBuilder();
 			// Add IF NOT EXISTS check
-			
+
 			sql.AppendLine($"IF NOT EXISTS (SELECT * FROM sys.tables t JOIN sys.schemas s ON t.schema_id = s.schema_id WHERE t.name = '{tableName}' AND s.name = '{schemaName}')");
 			sql.AppendLine("BEGIN");
 			sql.AppendLine($"    CREATE TABLE [{schemaName}].[{tableName}] (");
@@ -103,17 +110,57 @@ namespace mySalesforce {
 			sql.AppendLine("END");
 			return sql.ToString();
 		}
-
 		public List<string> GetChangeEventUrls(DataTable sfoTables) {
-			
+
 			return sfoTables.AsEnumerable()
 				.Select(row => $"/data/{row["name"]}ChangeEvent")
 				//.Where(name => name.EndsWith("__e", StringComparison.OrdinalIgnoreCase))
 				.OrderBy(name => name)
 				.ToList();
 		}
+		public (int RowsInserted, string TableName) RegisterExludedCDCFields(string xml) {
+			if (string.IsNullOrWhiteSpace(xml))
+				throw new ArgumentException("XML input cannot be empty.", nameof(xml));
+			try {
+				using (SqlConnection conn = new SqlConnection(_connectionString)) {
+					conn.Open();
+					using (SqlCommand cmd = new SqlCommand("xprRegisterCDCobject", conn)) {
+						cmd.CommandType = CommandType.StoredProcedure;
+						cmd.Parameters.AddWithValue("@XmlInput", xml);// Add XML input parameter
+						using (SqlDataReader reader = cmd.ExecuteReader()) {    // Execute and read output
+							if (reader.Read()) {
+								int rowsInserted = reader.GetInt32(0); // RowsInserted
+								string tableName = reader.GetString(1); // TableName
+								return (rowsInserted, tableName);
+							}
+						}
+					}
+				}
+			} catch (SqlException ex) {
+				throw new Exception($"SQL error executing sp_ProcessXmlToCDCTables: {ex.Message}", ex);
+			} catch (Exception ex) {
+				throw new Exception($"Error processing XML: {ex.Message}", ex);
+			}
+
+			throw new Exception("No results returned from stored procedure.");
+		}
+
+		public void AssertCDCObjectExist(string objectName) {
+			using (SqlConnection conn = new SqlConnection(_connectionString)) {
+				conn.Open();
+				using (SqlCommand cmd = new SqlCommand("SELECT dbo.fnObjectid(@ObjectName)", conn)) {
+					cmd.Parameters.AddWithValue("@ObjectName", objectName);
+					object result = cmd.ExecuteScalar(); // Get the function result
+					RaisSqlObjectExist(int.Parse(result.ToString()!), objectName, "Table", (int.Parse(result.ToString()!) > 0), cmd.CommandText);
+					Console.WriteLine("Function Output: " + (result != DBNull.Value ? result.ToString() : "NULL"));
+				}
+			}
+
+		}
 
 
+
+		#region helpers (private)
 		private static string mapToSqlType(string salesforceType, int length, string columnName) {
 			return salesforceType.ToLower() switch {
 				"string" => length > 0 && length <= 8000 ? $"VARCHAR({length})" : "NVARCHAR(MAX)",
@@ -145,6 +192,9 @@ namespace mySalesforce {
 				_ => throw new NotSupportedException($"Salesforce type {salesforceType} for column {columnName} is not supported.")
 			};
 		}
+
+		#endregion helpers (private)
+
 	}
 	#endregion	Public Methods
 }
@@ -154,6 +204,22 @@ public class SqlEventArg : EventArgs {
 	public SqlEventArg(string message, LogLevel ll) {
 		LogLevel = ll;
 		Message = message;
+	}
+}
+public class SqlObjectExist : EventArgs {
+	public LogLevel Loglevel { get; }
+	public string ObjectName { get; }
+	public string ObjectType { get; }
+	public bool Exist { get; }
+	public string Query { get; }
+	public int Id { get; }
+	public SqlObjectExist(string objectName, string objectType, int id, bool exist, string query) {
+		ObjectName = objectName;
+		ObjectType = objectType;
+		Exist = exist;
+		Query = query;
+		Loglevel = LogLevel.None;// this event is not for logging
+		Id = id;// row id when exist -1 otherwise
 	}
 }
 #region Extensions
@@ -202,7 +268,6 @@ public static class SqlServerLibExtensions {
 	public static void ImportAllRowsFrom(this DataTable target, DataTable source) {
 		foreach (DataRow row in source.Rows) target.ImportRow(row);
 	}
-
 	public static string GetSqlDataType(DataColumn column) {
 		string sqlType = column.DataType switch {
 			Type t when t == typeof(string) => $"NVARCHAR({(column.MaxLength > 0 ? column.MaxLength.ToString() : "MAX")})",
@@ -282,7 +347,6 @@ public static class SqlServerLibExtensions {
 
 		return ddl.ToString();
 	}
-
 	static string FormatDefaultValue(DataColumn column) {
 		if (column.DefaultValue == null)
 			throw new InvalidOperationException("DefaultValue cannot be null.");
@@ -299,6 +363,20 @@ public static class SqlServerLibExtensions {
 	}
 	static bool IsPrimaryKey(DataColumn column, DataTable table) {
 		return Array.Exists(table.PrimaryKey, pk => pk.ColumnName == column.ColumnName);
+	}
+	public static string GetXml(this DataTable table, string ColumnsToSelect) {
+		DataTable tblClipped = table.DefaultView.ToTable(true, ColumnsToSelect.Split(','));
+		tblClipped.TableName = table.TableName;
+
+
+
+		DataSet ds = new DataSet();
+
+
+
+		ds.Tables.Add(tblClipped.Copy());
+		ds.DataSetName = "X";
+		return ds.GetXml();
 	}
 }
 #endregion Extensions
