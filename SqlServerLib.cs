@@ -93,7 +93,6 @@ namespace mySalesforce {
 				RaisSqlEvent($"Error:{ex.Message}", LogLevel.Error);
 			}
 		}
-		//public void Table
 		public string GenerateCreateTableScript(DataTable schema, string schemaName, string tableName) {
 			StringBuilder sql = new StringBuilder();
 			// Add IF NOT EXISTS check
@@ -176,30 +175,27 @@ namespace mySalesforce {
 			}
 
 		}
-
-		public DataTable GetModified(DataTable dt) {
-			DataTable mDt = dt.Clone();
-			mDt.TableName = dt.TableName;
-			DataRow[] mRows = dt.Select("", "", DataViewRowState.ModifiedCurrent);
-			mDt.BeginLoadData();
-		
-			mRows
-					 .Select(row => {
-						 // Create array of values using LINQ: copy original values as-is
-						 object[] values = dt.Columns
-							 .Cast<DataColumn>()
-							 .Select(col => row[col.ColumnName])
-							// .Concat(new object[] { null }) // Append null for ModificationTime
-							 .ToArray();
-						 return mDt.LoadDataRow(values, false);
-					 })
-			.ToList(); // Execute the query
-			mDt.EndLoadData();
-
-			return mDt;
+		public void UpdateServerTable(DataTable modifiedTable, string schemaSelect) {
+			try {
+				int r = 0;
+				using (SqlConnection conn = new SqlConnection(_connectionString)) {
+					conn.Open();
+					SqlDataAdapter da = new SqlDataAdapter(schemaSelect, conn);
+					SqlCommandBuilder cb = new SqlCommandBuilder(da);
+					da.UpdateCommand = cb.GetUpdateCommand();
+					var changes = modifiedTable.GetChanges(DataRowState.Modified);
+					if (changes != null) {
+						da.Update(modifiedTable);
+						modifiedTable.AcceptChanges();
+						RaisSqlEvent($"Update command: {da.UpdateCommand.CommandText}", LogLevel.Information);
+					}
+				}
+			} catch (SqlException ex) {
+				RaisSqlEvent($"SQL Error: {ex.Message}\n{ex.StackTrace}", LogLevel.Error);
+			} catch (Exception ex) {
+				RaisSqlEvent($"Error: {ex.Message}\n{ex.StackTrace}", LogLevel.Error);
+			}
 		}
-
-
 		#region helpers (private)
 		private static string mapToSqlType(string salesforceType, int length, string columnName) {
 			return salesforceType.ToLower() switch {
@@ -232,9 +228,7 @@ namespace mySalesforce {
 				_ => throw new NotSupportedException($"Salesforce type {salesforceType} for column {columnName} is not supported.")
 			};
 		}
-
 		#endregion helpers (private)
-
 	}
 	#endregion	Public Methods
 }
