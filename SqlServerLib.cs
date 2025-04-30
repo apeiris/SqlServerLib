@@ -5,11 +5,41 @@ using Microsoft.Extensions.Logging;
 using System;
 using System.Data;
 using System.Data.Common;
+using System.Diagnostics.Metrics;
 using System.Runtime.CompilerServices;
 using System.Text;
 using static System.Runtime.InteropServices.JavaScript.JSType;
 namespace mySalesforce {
 	#region SqlServerLib.ctor
+	#region event args
+	public class SqlEventArg : EventArgs {
+		public LogLevel LogLevel { get; }
+		public string Message { get; }
+		public SqlEventArg(string message, LogLevel ll) {
+			LogLevel = ll;
+			Message = message;
+		}
+	}
+	public class SqlObjectQuery : EventArgs {
+		public LogLevel Loglevel { get; }
+		public string ObjectName { get; }
+		public string ObjectType { get; }
+		public bool Exist { get; }
+		public string Query { get; }
+		public int Id { get; }
+		public string message { get; }
+		public SqlObjectQuery(string objectName, string objectType, int id, bool exist, string query,string msg) {
+			
+			ObjectName = objectName;
+			ObjectType = objectType;
+			Exist = exist;
+			Query = query;
+			message = msg;
+			Loglevel = LogLevel.None;// this event is not for logging
+			Id = id;// row id when exist -1 otherwise
+		}
+	}
+	#endregion event args
 	public class SqlServerLib {
 		private readonly string? _connectionString;
 		private readonly ILogger<SqlServerLib> _l;
@@ -19,8 +49,10 @@ namespace mySalesforce {
 			message = $"{message}:{callerMemberName}:{callerLineNumber}";
 			SqlEvent?.Invoke(this, new SqlEventArg(message, ll));
 		}
-		private void RaisSqlObjectExist(int objectId, string objectName, string objectType, bool exists, string query) {
-			SqlObjectExist?.Invoke(this, new SqlObjectQuery(objectName, objectType, objectId, exists, query));
+		private void RaisSqlObjectExist(int objectId, string objectName, string objectType, bool exists, string query, [CallerMemberName] string mn="", [CallerLineNumber] int ln=0) {
+			string msg = $"{objectName}:{objectType}:{objectId}:{exists}:{mn}:{ln}";
+
+			SqlObjectExist?.Invoke(this, new SqlObjectQuery(objectName, objectType, objectId, exists, query,msg	));
 		}
 
 		public SqlServerLib(IConfiguration configuration, ILogger<SqlServerLib> logger) {
@@ -72,10 +104,10 @@ namespace mySalesforce {
 					}
 				}
 			} catch (SqlException ex) {
-				RaisSqlEvent($"SQL Error:{ex.Message}", LogLevel.Error);
+				RaisSqlEvent($"SQL Error:{ex.Message} , stmt:{sql}", LogLevel.Error);
 				throw;
 			} catch (Exception ex) {
-				RaisSqlEvent($"Error:{ex.Message}", LogLevel.Error);
+				RaisSqlEvent($"Error:{ex.Message} , stmt:{sql}", LogLevel.Error);
 				throw;
 			}
 			return dataTable;
@@ -163,21 +195,26 @@ namespace mySalesforce {
 
 			throw new Exception("No results returned from stored procedure.");
 		}
-		public void AssertCDCObjectExist(string objectName) {
+		public void AssertCDCObjectExist(string objectName,string schemaName="sfo") {
 			using (SqlConnection conn = new SqlConnection(_connectionString)) {
 				conn.Open();
-				using (SqlCommand cmd = new SqlCommand("SELECT dbo.fnObjectid(@ObjectName)", conn)) {
-					cmd.Parameters.AddWithValue("@ObjectName", objectName);
-					object result = cmd.ExecuteScalar(); // Get the function result
-					RaisSqlObjectExist(int.Parse(result.ToString()!), objectName, "Table", (int.Parse(result.ToString()!) > 0), cmd.CommandText);
-					Console.WriteLine("Function Output: " + (result != DBNull.Value ? result.ToString() : "NULL"));
+				try {
+					using (SqlCommand cmd = new SqlCommand("SELECT dbo.fnObjectid(@context,@ObjectName)", conn)) {
+						cmd.Parameters.AddWithValue("@context", schemaName);
+						cmd.Parameters.AddWithValue("@ObjectName", objectName);
+						object result = cmd.ExecuteScalar(); // Get the function result
+						RaisSqlObjectExist(int.Parse(result.ToString()!), objectName, "Table", (int.Parse(result.ToString()!) > 0), cmd.CommandText);
+						Console.WriteLine("Function Output: " + (result != DBNull.Value ? result.ToString() : "NULL"));
+					}
+				} catch (Exception ex) {
+					RaisSqlEvent($"Error executing SQL: {ex.Message}", LogLevel.Error);
+					throw;
 				}
 			}
 
 		}
 		public void UpdateServerTable(DataTable modifiedTable, string schemaSelect) {
 			try {
-				int r = 0;
 				using (SqlConnection conn = new SqlConnection(_connectionString)) {
 					conn.Open();
 					SqlDataAdapter da = new SqlDataAdapter(schemaSelect, conn);
@@ -185,9 +222,9 @@ namespace mySalesforce {
 					da.UpdateCommand = cb.GetUpdateCommand();
 					var changes = modifiedTable.GetChanges(DataRowState.Modified);
 					if (changes != null) {
-						da.Update(modifiedTable);
+						int rowsAffected=da.Update(modifiedTable);
 						modifiedTable.AcceptChanges();
-						RaisSqlEvent($"Update command: {da.UpdateCommand.CommandText}", LogLevel.Information);
+						RaisSqlEvent($"{rowsAffected}  Rows Affected: Update command: {da.UpdateCommand.CommandText}", LogLevel.Information);
 					}
 				}
 			} catch (SqlException ex) {
@@ -232,32 +269,7 @@ namespace mySalesforce {
 	}
 	#endregion	Public Methods
 }
-#region event args
-public class SqlEventArg : EventArgs {
-	public LogLevel LogLevel { get; }
-	public string Message { get; }
-	public SqlEventArg(string message, LogLevel ll) {
-		LogLevel = ll;
-		Message = message;
-	}
-}
-public class SqlObjectQuery : EventArgs {
-	public LogLevel Loglevel { get; }
-	public string ObjectName { get; }
-	public string ObjectType { get; }
-	public bool Exist { get; }
-	public string Query { get; }
-	public int Id { get; }
-	public SqlObjectQuery(string objectName, string objectType, int id, bool exist, string query) {
-		ObjectName = objectName;
-		ObjectType = objectType;
-		Exist = exist;
-		Query = query;
-		Loglevel = LogLevel.None;// this event is not for logging
-		Id = id;// row id when exist -1 otherwise
-	}
-}
-#endregion event args
+
 #region Extensions
 public static class SqlServerLibExtensions {
 	public static void AddIdentityColumn(this DataTable table,
