@@ -11,13 +11,31 @@ using System.Text;
 using static System.Runtime.InteropServices.JavaScript.JSType;
 namespace mySalesforce {
 	#region SqlServerLib.ctor
+	#region enums
+	public enum SqlEvents {
+		None,
+		Created,
+		Inserted,
+		Deleted,
+		Updated,
+		ReSeeded,
+		SqlException,
+		Exception,
+	}
+	#endregion enums
 	#region event args
 	public class SqlEventArg : EventArgs {
 		public LogLevel LogLevel { get; }
 		public string Message { get; }
-		public SqlEventArg(string message, LogLevel ll) {
+		public SqlEvents SqlEvent { get; }
+		public string ReturningFrom { get; }
+		public bool HasErrors { get; } = false;
+		public SqlEventArg(string message, SqlEvents evt, LogLevel ll, string returningFrom, bool hasErrors) {
 			LogLevel = ll;
 			Message = message;
+			SqlEvent = evt;
+			ReturningFrom = returningFrom;
+			hasErrors = hasErrors;
 		}
 	}
 	public class SqlObjectQuery : EventArgs {
@@ -28,8 +46,8 @@ namespace mySalesforce {
 		public string Query { get; }
 		public int Id { get; }
 		public string message { get; }
-		public SqlObjectQuery(string objectName, string objectType, int id, bool exist, string query,string msg) {
-			
+		public SqlObjectQuery(string objectName, string objectType, int id, bool exist, string query, string msg) {
+
 			ObjectName = objectName;
 			ObjectType = objectType;
 			Exist = exist;
@@ -45,14 +63,14 @@ namespace mySalesforce {
 		private readonly ILogger<SqlServerLib> _l;
 		public event EventHandler<SqlEventArg> SqlEvent;
 		public event EventHandler<SqlObjectQuery> SqlObjectExist;
-		private void RaisSqlEvent(string message, LogLevel ll, [CallerMemberName] string callerMemberName = "", [CallerLineNumber] int callerLineNumber = 0) {
+		private void RaisSqlEvent(string message, SqlEvents enmSqlEvent, LogLevel ll, bool hasErrors, [CallerMemberName] string callerMemberName = "", [CallerLineNumber] int callerLineNumber = 0) {
 			message = $"{message}:{callerMemberName}:{callerLineNumber}";
-			SqlEvent?.Invoke(this, new SqlEventArg(message, ll));
+			SqlEvent?.Invoke(this, new SqlEventArg(message, enmSqlEvent, ll, callerMemberName, hasErrors));
 		}
-		private void RaisSqlObjectExist(int objectId, string objectName, string objectType, bool exists, string query, [CallerMemberName] string mn="", [CallerLineNumber] int ln=0) {
+		private void RaisSqlObjectExist(int objectId, string objectName, string objectType, bool exists, string query, [CallerMemberName] string mn = "", [CallerLineNumber] int ln = 0) {
 			string msg = $"{objectName}:{objectType}:{objectId}:{exists}:{mn}:{ln}";
 
-			SqlObjectExist?.Invoke(this, new SqlObjectQuery(objectName, objectType, objectId, exists, query,msg	));
+			SqlObjectExist?.Invoke(this, new SqlObjectQuery(objectName, objectType, objectId, exists, query, msg));
 		}
 
 		public SqlServerLib(IConfiguration configuration, ILogger<SqlServerLib> logger) {
@@ -83,13 +101,13 @@ namespace mySalesforce {
 					}
 				}
 			} catch (SqlException ex) {
-				RaisSqlEvent($"SQL Error:{ex.Message}", LogLevel.Error);
+				RaisSqlEvent($"SQL Error:{ex.Message}", SqlEvents.SqlException, LogLevel.Error, true);
 				throw;
 			} catch (Exception ex) {
-				RaisSqlEvent($"Error:{ex.Message}", LogLevel.Error);
+				RaisSqlEvent($"Error:{ex.Message}", SqlEvents.Exception, LogLevel.Error, true);
 				throw;
 			}
-			RaisSqlEvent($"{dataTable.Rows.Count} rows", LogLevel.Debug);
+			RaisSqlEvent($"{dataTable.Rows.Count} rows", SqlEvents.None, LogLevel.Debug, true);
 			return dataTable;
 		}
 		public DataTable Select(string sql, string primaryKey = "Id") {
@@ -104,10 +122,10 @@ namespace mySalesforce {
 					}
 				}
 			} catch (SqlException ex) {
-				RaisSqlEvent($"SQL Error:{ex.Message} , stmt:{sql}", LogLevel.Error);
+				RaisSqlEvent($"SQL Error:{ex.Message} , stmt:{sql}", SqlEvents.SqlException, LogLevel.Error, true);
 				throw;
 			} catch (Exception ex) {
-				RaisSqlEvent($"Error:{ex.Message} , stmt:{sql}", LogLevel.Error);
+				RaisSqlEvent($"Error:{ex.Message} , stmt:{sql}", SqlEvents.Exception, LogLevel.Error, true);
 				throw;
 			}
 			return dataTable;
@@ -118,11 +136,26 @@ namespace mySalesforce {
 					connection.Open();// Open the connection
 					using (SqlCommand command = new SqlCommand(script, connection))
 						command.ExecuteNonQuery();
+					
 				}
 			} catch (SqlException ex) {
-				RaisSqlEvent($"SQL Error:{ex.Message}", LogLevel.Error);
+				//RaisSqlEvent($"SQL Error:{ex.Message}",SqlEvents.SqlException, LogLevel.Error);
+				RaisSqlEvent($"SQL Error:{ex.Message}", SqlEvents.SqlException, LogLevel.Error, true);
+
 			} catch (Exception ex) {
-				RaisSqlEvent($"Error:{ex.Message}", LogLevel.Error);
+				RaisSqlEvent($"Error:{ex.Message}", SqlEvents.Exception, LogLevel.Error, true);
+			}
+
+		}
+
+		public void DeleteCDCObject(string objectName) {
+			try {
+				ExecuteNoneQuery($"DELETE FROM CDCObjects WHERE objectName ='{objectName}'");
+				RaisSqlEvent($"Deleted {objectName} from CDC", SqlEvents.Deleted, LogLevel.Information,hasErrors:false);
+			} catch (SqlException ex) {
+				RaisSqlEvent($"SQL Error:{ex.Message}", SqlEvents.SqlException, LogLevel.Error, true);
+			} catch (Exception ex) {
+				RaisSqlEvent($"Error:{ex.Message}", SqlEvents.Exception, LogLevel.Error, true);
 			}
 		}
 		public string GenerateCreateTableScript(DataTable schema, string schemaName, string tableName) {
@@ -162,12 +195,14 @@ namespace mySalesforce {
 			return sql.ToString();
 		}
 		public List<string> GetChangeEventUrls(DataTable sfoTables) {
-
 			return sfoTables.AsEnumerable()
-				.Select(row => $"/data/{row["name"]}ChangeEvent")
-				//.Where(name => name.EndsWith("__e", StringComparison.OrdinalIgnoreCase))
-				.OrderBy(name => name)
-				.ToList();
+			.Select(row => {
+				string name = row.Table.Columns.Contains("name") && !string.IsNullOrEmpty(row["name"]?.ToString())
+					? row["name"].ToString() : row["ObjectName"].ToString();
+				return $"/data/{name}ChangeEvent";
+			})//.Where(name => name.EndsWith("__e", StringComparison.OrdinalIgnoreCase))
+			.OrderBy(name => name)
+			.ToList();
 		}
 		public (int RowsInserted, string TableName) RegisterExludedCDCFields(string xml) {
 			if (string.IsNullOrWhiteSpace(xml))
@@ -182,32 +217,36 @@ namespace mySalesforce {
 							if (reader.Read()) {
 								int rowsInserted = reader.GetInt32(0); // RowsInserted
 								string tableName = reader.GetString(1); // TableName
+								RaisSqlEvent($"{rowsInserted} rows insert to {tableName}", SqlEvents.Inserted, LogLevel.Information, false);
 								return (rowsInserted, tableName);
 							}
 						}
 					}
 				}
 			} catch (SqlException ex) {
-				throw new Exception($"SQL error executing sp_ProcessXmlToCDCTables: {ex.Message}", ex);
+				throw new Exception($"SQL error executing xprRegisterCDCobject: {ex.Message}", ex);
 			} catch (Exception ex) {
 				throw new Exception($"Error processing XML: {ex.Message}", ex);
 			}
 
 			throw new Exception("No results returned from stored procedure.");
 		}
-		public void AssertCDCObjectExist(string objectName,string schemaName="sfo") {
+		public void AssertCDCObjectExist(string objectName, string schemaName = "sfo") {
 			using (SqlConnection conn = new SqlConnection(_connectionString)) {
 				conn.Open();
 				try {
 					using (SqlCommand cmd = new SqlCommand("SELECT dbo.fnObjectid(@context,@ObjectName)", conn)) {
 						cmd.Parameters.AddWithValue("@context", schemaName);
 						cmd.Parameters.AddWithValue("@ObjectName", objectName);
-						object result = cmd.ExecuteScalar(); // Get the function result
-						RaisSqlObjectExist(int.Parse(result.ToString()!), objectName, "Table", (int.Parse(result.ToString()!) > 0), cmd.CommandText);
-						Console.WriteLine("Function Output: " + (result != DBNull.Value ? result.ToString() : "NULL"));
+						object result = cmd.ExecuteScalar();
+
+						int rowNum = (result != null && result != DBNull.Value) ? Convert.ToInt32(result) : -1;
+
+						RaisSqlObjectExist(int.Parse(rowNum.ToString()!), objectName, "Table", (rowNum > 0), cmd.CommandText);
+						Console.WriteLine("Function Output: " + (rowNum));
 					}
 				} catch (Exception ex) {
-					RaisSqlEvent($"Error executing SQL: {ex.Message}", LogLevel.Error);
+					RaisSqlEvent($"Error executing SQL: {ex.Message}", SqlEvents.Exception, LogLevel.Error, true);
 					throw;
 				}
 			}
@@ -222,15 +261,15 @@ namespace mySalesforce {
 					da.UpdateCommand = cb.GetUpdateCommand();
 					var changes = modifiedTable.GetChanges(DataRowState.Modified);
 					if (changes != null) {
-						int rowsAffected=da.Update(modifiedTable);
+						int rowsAffected = da.Update(modifiedTable);
 						modifiedTable.AcceptChanges();
-						RaisSqlEvent($"{rowsAffected}  Rows Affected: Update command: {da.UpdateCommand.CommandText}", LogLevel.Information);
+						RaisSqlEvent($"{rowsAffected}  Rows Affected: Update command: {da.UpdateCommand.CommandText}", SqlEvents.Updated, LogLevel.Information, true);
 					}
 				}
 			} catch (SqlException ex) {
-				RaisSqlEvent($"SQL Error: {ex.Message}\n{ex.StackTrace}", LogLevel.Error);
+				RaisSqlEvent($"SQL Error: {ex.Message}\n{ex.StackTrace}", SqlEvents.SqlException, LogLevel.Error, true);
 			} catch (Exception ex) {
-				RaisSqlEvent($"Error: {ex.Message}\n{ex.StackTrace}", LogLevel.Error);
+				RaisSqlEvent($"Error: {ex.Message}\n{ex.StackTrace}", SqlEvents.Exception, LogLevel.Error, true);
 			}
 		}
 		#region helpers (private)
