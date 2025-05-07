@@ -61,6 +61,7 @@ namespace mySalesforce {
 	public class SqlServerLib {
 		private readonly string? _connectionString;
 		private readonly ILogger<SqlServerLib> _l;
+		private readonly string _sqlSchemaName = "sfo";
 		public event EventHandler<SqlEventArg> SqlEvent;
 		public event EventHandler<SqlObjectQuery> SqlObjectExist;
 		private void RaisSqlEvent(string message, SqlEvents enmSqlEvent, LogLevel ll, bool hasErrors, [CallerMemberName] string callerMemberName = "", [CallerLineNumber] int callerLineNumber = 0) {
@@ -78,6 +79,8 @@ namespace mySalesforce {
 				throw new ArgumentNullException(nameof(configuration));
 
 			_connectionString = configuration.GetConnectionString("mssql");
+			_sqlSchemaName = configuration.GetSection("Salesforce")["SqlSchemaName"]!;
+			
 			_l = logger ?? throw new ArgumentNullException(nameof(logger));
 			if (string.IsNullOrWhiteSpace(_connectionString))
 				throw new InvalidOperationException("Connection string 'mssql' is missing or empty in configuration.");
@@ -130,13 +133,32 @@ namespace mySalesforce {
 			}
 			return dataTable;
 		}
+
+		public int ExecuteScalar (string sql) {
+			int result = 0;
+			try {
+				using (SqlConnection connection = new SqlConnection(_connectionString)) {
+					connection.Open();
+					using (SqlCommand command = new SqlCommand(sql, connection)) {
+						result = Convert.ToInt32(command.ExecuteScalar());
+					}
+				}
+			} catch (SqlException ex) {
+				RaisSqlEvent($"SQL Error:{ex.Message}", SqlEvents.SqlException, LogLevel.Error, true);
+				throw;
+			} catch (Exception ex) {
+				RaisSqlEvent($"Error:{ex.Message}", SqlEvents.Exception, LogLevel.Error, true);
+				throw;
+			}
+			return result;
+		}
 		public void ExecuteNoneQuery(string script) {
 			try {
 				using (SqlConnection connection = new SqlConnection(_connectionString)) {
 					connection.Open();// Open the connection
 					using (SqlCommand command = new SqlCommand(script, connection))
 						command.ExecuteNonQuery();
-					
+
 				}
 			} catch (SqlException ex) {
 				//RaisSqlEvent($"SQL Error:{ex.Message}",SqlEvents.SqlException, LogLevel.Error);
@@ -151,13 +173,82 @@ namespace mySalesforce {
 		public void DeleteCDCObject(string objectName) {
 			try {
 				ExecuteNoneQuery($"DELETE FROM CDCObjects WHERE objectName ='{objectName}'");
-				RaisSqlEvent($"Deleted {objectName} from CDC", SqlEvents.Deleted, LogLevel.Information,hasErrors:false);
+				RaisSqlEvent($"Deleted {objectName} from CDC", SqlEvents.Deleted, LogLevel.Information, hasErrors: false);
 			} catch (SqlException ex) {
 				RaisSqlEvent($"SQL Error:{ex.Message}", SqlEvents.SqlException, LogLevel.Error, true);
 			} catch (Exception ex) {
 				RaisSqlEvent($"Error:{ex.Message}", SqlEvents.Exception, LogLevel.Error, true);
 			}
 		}
+
+		private string queryStringsForInsert(DataTable dt ) {
+			var rows = dt.AsEnumerable();
+
+			// Get column names and formatted values
+			var columns = rows.Select(r => r["FieldName"].ToString()).ToList();
+			var values = rows.Select(r =>
+			{
+				var value = r["Value"]?.ToString();
+				var dataType = r["DataType"]?.ToString();
+
+				// Handle value formatting based on DataType using switch
+				return dataType switch {
+					"DateTime" when long.TryParse(value, out long unixTimestamp) =>
+						// Convert Unix timestamp (milliseconds) to SQL DateTime
+						$"'{DateTimeOffset.FromUnixTimeMilliseconds(unixTimestamp).UtcDateTime.ToString("yyyy-MM-dd HH:mm:ss")}'",
+					_ => $"'{value?.Replace("'", "''")}'" // Default case: escape single quotes
+				};
+			}).ToList();
+
+			// Construct INSERT statement
+			var columnsClause = string.Join(", ", columns);
+			var valuesClause = string.Join(", ", values);
+			return $"INSERT INTO {dt.TableName} ({columnsClause}) VALUES ({valuesClause})";
+		}
+
+		private (string _setClause, string _whereClause) queryStringsforUpdate(DataTable dt, string _keyName = "Id") {
+			var rows = dt.AsEnumerable();
+			var setClause = string.Join(", ", rows
+				.Where(r => !string.Equals(r["FieldName"].ToString(), _keyName, StringComparison.OrdinalIgnoreCase))
+				.Select(r => {
+					var field = r["FieldName"].ToString();
+					var value = r["Value"]?.ToString();
+					var dataType = r["DataType"]?.ToString();
+					value = dataType switch {	// Handle value formatting based on DataType using switch
+						"DateTime" when long.TryParse(value, out long unixTimestamp) =>
+							DateTimeOffset.FromUnixTimeMilliseconds(unixTimestamp)	// Convert Unix timestamp (milliseconds) to SQL DateTime
+								.UtcDateTime
+								.ToString("yyyy-MM-dd HH:mm:ss"),
+						_ => value?.Replace("'", "''") // Default case: escape single quotes
+					};
+					return $"{field} = '{value}'";
+				}));
+			var whereValue = rows
+				.FirstOrDefault(r => string.Equals(r["FieldName"].ToString(), _keyName, StringComparison.OrdinalIgnoreCase))?["Value"]?.ToString();
+			var whereClause = $"{_keyName} = '{whereValue?.Replace("'", "''")}'";
+			return (setClause, whereClause);
+		}
+
+		public void CDCUpdateOrInsert(DataTable dt)// Column Name and value
+		{
+			string setClause = "", whereClause = "";
+			
+			(setClause, whereClause) = queryStringsforUpdate(dt, "Id");
+			string tblName = $"{_sqlSchemaName}.{dt.TableName}";
+			string sql = $"SELECT COUNT(*) from {tblName} where {whereClause};";
+			int count = ExecuteScalar(sql);
+			if (count > 0) {
+				sql = $"UPDATE {tblName} SET {setClause} WHERE {whereClause};";
+				ExecuteNoneQuery(sql);
+				RaisSqlEvent($"Updated {dt.Rows.Count} rows in {tblName}", SqlEvents.Updated, LogLevel.Information, false);
+			} else {
+				sql = queryStringsForInsert(dt);
+				ExecuteNoneQuery(sql);
+				RaisSqlEvent($"Inserted {dt.Rows.Count} rows in {tblName}", SqlEvents.Inserted, LogLevel.Information, false);
+			}
+
+		}
+
 		public string GenerateCreateTableScript(DataTable schema, string schemaName, string tableName) {
 			StringBuilder sql = new StringBuilder();
 			// Add IF NOT EXISTS check
@@ -252,7 +343,8 @@ namespace mySalesforce {
 			}
 
 		}
-		public void UpdateServerTable(DataTable modifiedTable, string schemaSelect) {
+		public void UpdateServerTable(DataTable modifiedTable, string schemaSelect) {//		_sqlServerLib.UpdateServerTable(Fields, "SELECT [Id],[IsExcluded]  FROM [dbo].[CDCObjectFields] ");
+
 			try {
 				using (SqlConnection conn = new SqlConnection(_connectionString)) {
 					conn.Open();
