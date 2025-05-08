@@ -1,14 +1,9 @@
-﻿using Azure.Core.GeoJson;
+﻿using System.Data;
+using System.Runtime.CompilerServices;
+using System.Text;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
-using System;
-using System.Data;
-using System.Data.Common;
-using System.Diagnostics.Metrics;
-using System.Runtime.CompilerServices;
-using System.Text;
-using static System.Runtime.InteropServices.JavaScript.JSType;
 namespace mySalesforce {
 	#region SqlServerLib.ctor
 	#region enums
@@ -80,7 +75,7 @@ namespace mySalesforce {
 
 			_connectionString = configuration.GetConnectionString("mssql");
 			_sqlSchemaName = configuration.GetSection("Salesforce")["SqlSchemaName"]!;
-			
+
 			_l = logger ?? throw new ArgumentNullException(nameof(logger));
 			if (string.IsNullOrWhiteSpace(_connectionString))
 				throw new InvalidOperationException("Connection string 'mssql' is missing or empty in configuration.");
@@ -133,8 +128,7 @@ namespace mySalesforce {
 			}
 			return dataTable;
 		}
-
-		public int ExecuteScalar (string sql) {
+		public int ExecuteScalar(string sql) {
 			int result = 0;
 			try {
 				using (SqlConnection connection = new SqlConnection(_connectionString)) {
@@ -169,7 +163,6 @@ namespace mySalesforce {
 			}
 
 		}
-
 		public void DeleteCDCObject(string objectName) {
 			try {
 				ExecuteNoneQuery($"DELETE FROM CDCObjects WHERE objectName ='{objectName}'");
@@ -180,14 +173,12 @@ namespace mySalesforce {
 				RaisSqlEvent($"Error:{ex.Message}", SqlEvents.Exception, LogLevel.Error, true);
 			}
 		}
-
-		private string queryStringsForInsert(DataTable dt ) {
+		private string queryStringsForInsert(DataTable dt) {
 			var rows = dt.AsEnumerable();
 
 			// Get column names and formatted values
 			var columns = rows.Select(r => r["FieldName"].ToString()).ToList();
-			var values = rows.Select(r =>
-			{
+			var values = rows.Select(r => {
 				var value = r["Value"]?.ToString();
 				var dataType = r["DataType"]?.ToString();
 
@@ -205,7 +196,6 @@ namespace mySalesforce {
 			var valuesClause = string.Join(", ", values);
 			return $"INSERT INTO {dt.TableName} ({columnsClause}) VALUES ({valuesClause})";
 		}
-
 		private (string _setClause, string _whereClause) queryStringsforUpdate(DataTable dt, string _keyName = "Id") {
 			var rows = dt.AsEnumerable();
 			var setClause = string.Join(", ", rows
@@ -214,9 +204,9 @@ namespace mySalesforce {
 					var field = r["FieldName"].ToString();
 					var value = r["Value"]?.ToString();
 					var dataType = r["DataType"]?.ToString();
-					value = dataType switch {	// Handle value formatting based on DataType using switch
+					value = dataType switch {   // Handle value formatting based on DataType using switch
 						"DateTime" when long.TryParse(value, out long unixTimestamp) =>
-							DateTimeOffset.FromUnixTimeMilliseconds(unixTimestamp)	// Convert Unix timestamp (milliseconds) to SQL DateTime
+							DateTimeOffset.FromUnixTimeMilliseconds(unixTimestamp)  // Convert Unix timestamp (milliseconds) to SQL DateTime
 								.UtcDateTime
 								.ToString("yyyy-MM-dd HH:mm:ss"),
 						_ => value?.Replace("'", "''") // Default case: escape single quotes
@@ -228,27 +218,7 @@ namespace mySalesforce {
 			var whereClause = $"{_keyName} = '{whereValue?.Replace("'", "''")}'";
 			return (setClause, whereClause);
 		}
-
-		public void CDCUpdateOrInsert(DataTable dt)// Column Name and value
-		{
-			string setClause = "", whereClause = "";
-			
-			(setClause, whereClause) = queryStringsforUpdate(dt, "Id");
-			string tblName = $"{_sqlSchemaName}.{dt.TableName}";
-			string sql = $"SELECT COUNT(*) from {tblName} where {whereClause};";
-			int count = ExecuteScalar(sql);
-			if (count > 0) {
-				sql = $"UPDATE {tblName} SET {setClause} WHERE {whereClause};";
-				ExecuteNoneQuery(sql);
-				RaisSqlEvent($"Updated {dt.Rows.Count} rows in {tblName}", SqlEvents.Updated, LogLevel.Information, false);
-			} else {
-				sql = queryStringsForInsert(dt);
-				ExecuteNoneQuery(sql);
-				RaisSqlEvent($"Inserted {dt.Rows.Count} rows in {tblName}", SqlEvents.Inserted, LogLevel.Information, false);
-			}
-
-		}
-
+		
 		public string GenerateCreateTableScript(DataTable schema, string schemaName, string tableName) {
 			StringBuilder sql = new StringBuilder();
 			// Add IF NOT EXISTS check
@@ -343,6 +313,21 @@ namespace mySalesforce {
 			}
 
 		}
+		public bool AssertRecord(string ObjectName, string recordId, string schemaName = "sfo") {
+			using (SqlConnection conn = new SqlConnection(_connectionString)) {
+				conn.Open();
+				try {
+					using (SqlCommand cmd = new SqlCommand($"SELECT COUNT(*) FROM {schemaName}.{ObjectName} WHERE Id = @Id", conn)) {
+						cmd.Parameters.AddWithValue("@Id", recordId);
+						int count = (int)cmd.ExecuteScalar();
+						return count > 0;
+					}
+				} catch (Exception ex) {
+					RaisSqlEvent($"Error executing SQL: {ex.Message}", SqlEvents.Exception, LogLevel.Error, true);
+					throw;
+				}
+			}
+		}
 		public void UpdateServerTable(DataTable modifiedTable, string schemaSelect) {//		_sqlServerLib.UpdateServerTable(Fields, "SELECT [Id],[IsExcluded]  FROM [dbo].[CDCObjectFields] ");
 
 			try {
@@ -364,7 +349,95 @@ namespace mySalesforce {
 				RaisSqlEvent($"Error: {ex.Message}\n{ex.StackTrace}", SqlEvents.Exception, LogLevel.Error, true);
 			}
 		}
+		public async Task InsertRecordAsync(DataTable dataTable, string schemaName = "sfo") {
+			if (dataTable == null || dataTable.Rows.Count == 0) {
+				throw new ArgumentException("DataTable is empty or null.");
+			}
+
+			try {
+				string tableName = dataTable.TableName;
+				using (var connection = new SqlConnection(_connectionString)) {
+					await connection.OpenAsync();
+					DataTable schemaTable = await getTableSchemaAsync(connection, tableName);// Retrieve schema using ftSfoSchema function
+					DataRow row = dataTable.Rows[0];// Get the first row from DataTable
+					var dtColumns = dataTable.Columns.Cast<DataColumn>()// Map DataTable columns to SQL Server schema (case-insensitive)
+						.Select(col => col.ColumnName)
+						.ToList();
+					var validColumns = schemaTable.AsEnumerable()
+						.Where(s => dtColumns.Any(dtCol => dtCol.Equals(s.Field<string>("COLUMN_NAME"), StringComparison.OrdinalIgnoreCase)))
+						.Select(s => new {
+							ColumnName = s.Field<string>("COLUMN_NAME"),
+							DataType = s.Field<string>("DATA_TYPE"),
+							IsNullable = s.Field<string>("IS_NULLABLE") == "YES",
+							MaxLength = s.IsNull("CHARACTER_MAXIMUM_LENGTH") ? -1 : s.Field<int>("CHARACTER_MAXIMUM_LENGTH")
+						})
+						.ToList();
+					if (!validColumns.Any()) throw new Exception("No matching columns found between DataTable and SQL Server table schema.");
+
+					var columnNames = string.Join(", ", validColumns.Select(c => c.ColumnName));
+					var parameterNames = string.Join(", ", validColumns.Select(c => $"@{c.ColumnName}"));
+					string sql = $"INSERT INTO sfo.{tableName} ({columnNames}) VALUES ({parameterNames})";
+					using (var command = new SqlCommand(sql, connection)) {
+						validColumns.ForEach(col =>// Add parameters with type conversion
+										{
+											var dtColName = dtColumns.FirstOrDefault(c => c.Equals(col.ColumnName, StringComparison.OrdinalIgnoreCase));
+											object value = row[dtColName];
+											if (value == null || value == DBNull.Value) {   // Handle nullability
+												if (!col.IsNullable) throw new Exception($"Column {col.ColumnName} is not nullable but received a null value.");
+
+												command.Parameters.AddWithValue($"@{col.ColumnName}", DBNull.Value);
+												return;
+											}
+											switch (col.DataType.ToLower()) {// Handle data type conversion and length validation
+												case "varchar":
+												case "nvarchar":
+												string stringValue = value.ToString();
+												if (col.MaxLength > 0 && stringValue.Length > col.MaxLength) throw new Exception($"Value for {col.ColumnName} exceeds maximum length of {col.MaxLength}.");
+												command.Parameters.AddWithValue($"@{col.ColumnName}", stringValue);
+												break;
+												case "int":
+												if (!int.TryParse(value.ToString(), out int intValue)) throw new Exception($"Cannot convert value for {col.ColumnName} to int.");
+												command.Parameters.AddWithValue($"@{col.ColumnName}", intValue);
+												break;
+												case "decimal":
+												if (!decimal.TryParse(value.ToString(), out decimal decimalValue)) throw new Exception($"Cannot convert value for {col.ColumnName} to decimal.");
+												command.Parameters.AddWithValue($"@{col.ColumnName}", decimalValue);
+												break;
+												case "datetime":
+												if (!DateTime.TryParse(value.ToString(), out DateTime dateValue)) throw new Exception($"Cannot convert value for {col.ColumnName} to datetime.");
+												command.Parameters.AddWithValue($"@{col.ColumnName}", dateValue);
+												break;
+												case "bit":
+												if (!bool.TryParse(value.ToString(), out bool boolValue)) throw new Exception($"Cannot convert value for {col.ColumnName} to bit.");
+												command.Parameters.AddWithValue($"@{col.ColumnName}", boolValue);
+												break;
+												default:
+												command.Parameters.AddWithValue($"@{col.ColumnName}", value.ToString());
+												break;
+											}
+										});
+						await command.ExecuteNonQueryAsync();
+					}
+				}
+			} catch (SqlException ex) {
+				throw new Exception($"SQL Server error during insert: {ex.Message}", ex);
+			} catch (Exception ex) {
+				throw new Exception($"Error inserting record into SQL Server: {ex.Message}", ex);
+			}
+		}
 		#region helpers (private)
+		private async Task<DataTable> getTableSchemaAsync(SqlConnection connection, string tableName) {
+			var schemaTable = new DataTable();
+			string sql = "SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE FROM dbo.ftSfoSchema(@TableName)";
+			using (var command = new SqlCommand(sql, connection)) {
+				command.Parameters.AddWithValue("@TableName", tableName);
+				using (var adapter = new SqlDataAdapter(command)) 	adapter.Fill(schemaTable);
+			}
+			if (schemaTable.Rows.Count == 0) 	throw new Exception($"No schema found for table {tableName} in schema sfo.");
+			return schemaTable;
+		}
+
+
 		private static string mapToSqlType(string salesforceType, int length, string columnName) {
 			return salesforceType.ToLower() switch {
 				"string" => length > 0 && length <= 8000 ? $"VARCHAR({length})" : "NVARCHAR(MAX)",
