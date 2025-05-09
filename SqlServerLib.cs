@@ -597,7 +597,7 @@ namespace mySalesforce {
 					case "date":
 					if (long.TryParse(value?.ToString(), out long unixMillis) && unixMillis >= 0) {
 						// Convert Unix epoch milliseconds to DateTime (UTC)
-						DateTime epochStart = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+						DateTime epochStart = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Local);
 						DateTime parsedDate = epochStart.AddMilliseconds(unixMillis);
 						command.Parameters.Add(new SqlParameter($"@{col.ColumnName}", SqlDbType.DateTime) { Value = parsedDate });
 					} else if (DateTime.TryParse(value?.ToString(), out DateTime parsedDateFromString)) {
