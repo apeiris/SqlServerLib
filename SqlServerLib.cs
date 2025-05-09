@@ -4,6 +4,7 @@ using System.Text;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
+using static System.Runtime.InteropServices.JavaScript.JSType;
 namespace mySalesforce {
 	#region SqlServerLib.ctor
 	#region enums
@@ -335,27 +336,50 @@ namespace mySalesforce {
 				}
 			}
 		}
-		public void UpdateServerTable(DataTable modifiedTable, string schemaSelect) {//		_sqlServerLib.UpdateServerTable(Fields, "SELECT [Id],[IsExcluded]  FROM [dbo].[CDCObjectFields] ");
-
+		private string columnList(DataTable dt) {
+			string cList = string.Join(",", dt.Columns.Cast<DataColumn>()
+			.Select(col => $"[{col.ColumnName}]"));
+			return cList;
+		}
+		public void UpdateServerTable(DataTable modifiedTable, string schemaSelect) {
 			try {
 				using (SqlConnection conn = new SqlConnection(_connectionString)) {
 					conn.Open();
+					string columns = columnList(modifiedTable);
 					SqlDataAdapter da = new SqlDataAdapter(schemaSelect, conn);
 					SqlCommandBuilder cb = new SqlCommandBuilder(da);
 					da.UpdateCommand = cb.GetUpdateCommand();
+
+					// Reassign values to simulate modification
+					modifiedTable.AsEnumerable()
+						.Where(row => row.RowState == DataRowState.Unchanged)
+						.ToList()
+						.ForEach(row => {
+							modifiedTable.Columns.Cast<DataColumn>()
+								.ToList()
+								.ForEach(col => row[col] = row[col]); // reassign same value
+							row.SetModified();
+						});
+
 					var changes = modifiedTable.GetChanges(DataRowState.Modified);
 					if (changes != null) {
-						int rowsAffected = da.Update(modifiedTable);
+						int rowsAffected = da.Update(changes);
 						modifiedTable.AcceptChanges();
-						RaisSqlEvent($"{rowsAffected}  Rows Affected: Update command: {da.UpdateCommand.CommandText}", SqlEvents.Updated, LogLevel.Information, true);
+						RaisSqlEvent($"{rowsAffected} Rows Affected: Update command: {da.UpdateCommand.CommandText}", SqlEvents.Updated, LogLevel.Information, true);
 					}
 				}
 			} catch (SqlException ex) {
-				RaisSqlEvent($"SQL Error: {ex.Message}\n{ex.StackTrace}", SqlEvents.SqlException, LogLevel.Error, true);
+				RaisSqlEvent($"SQL Error: {ex.Message}", SqlEvents.SqlException, LogLevel.Error, true);
 			} catch (Exception ex) {
-				RaisSqlEvent($"Error: {ex.Message}\n{ex.StackTrace}", SqlEvents.Exception, LogLevel.Error, true);
+				RaisSqlEvent($"Error: {ex.Message}", SqlEvents.Exception, LogLevel.Error, true);
 			}
 		}
+
+
+
+
+
+
 		/*
 		public async Task InsertRecordAsync(DataTable dataTable, string schemaName = "sfo") {
 			if (dataTable == null || dataTable.Rows.Count == 0) {
@@ -433,28 +457,19 @@ namespace mySalesforce {
 		}
 		*/
 
-		public async Task InsertRecordAsync(DataTable dataTable, string schemaName = "sfo") {
-			if (dataTable == null || dataTable.Rows.Count == 0) {
+		public async Task UpdateRecordAsync(DataTable dataTable, string schemaName = "sfo") {
+			if (dataTable == null || dataTable.Rows.Count == 0)
 				throw new ArgumentException("DataTable is empty or null.");
-			}
 
 			string tableName = dataTable.TableName;
 
 			try {
 				using (var connection = new SqlConnection(_connectionString)) {
 					await connection.OpenAsync();
-
-					// Retrieve schema using ftSfoSchema function
 					DataTable schemaTable = await getTableSchemaAsync(connection, tableName);
-
-					// Get the first row from DataTable
 					DataRow row = dataTable.Rows[0];
-
-					// Map DataTable columns to SQL Server schema (case-insensitive)
 					var dtColumns = dataTable.Columns.Cast<DataColumn>()
-						.Select(col => col.ColumnName)
-						.ToList();
-
+						.Select(col => col.ColumnName).ToList();
 					var validColumns = schemaTable.AsEnumerable()
 						.Where(s => dtColumns.Any(dtCol => dtCol.Equals(s.Field<string>("COLUMN_NAME"), StringComparison.OrdinalIgnoreCase)))
 						.Select(s => new ColumnMetadata {
@@ -462,23 +477,52 @@ namespace mySalesforce {
 							DataType = s.Field<string>("DATA_TYPE"),
 							IsNullable = s.Field<string>("IS_NULLABLE") == "YES",
 							MaxLength = s.IsNull("CHARACTER_MAXIMUM_LENGTH") ? -1 : s.Field<int>("CHARACTER_MAXIMUM_LENGTH")
-						})
-						.ToList();
-
-					if (!validColumns.Any()) {
+						}).ToList();
+					if (!validColumns.Any()) 	
 						throw new Exception("No matching columns found between DataTable and SQL Server table schema.");
+					var primaryKeyColumn = validColumns.First();
+					var updateAssignments = string.Join(", ", validColumns
+						.Skip(1) // Skip primary key column for updates
+						.Select(c => $"{c.ColumnName} = @{c.ColumnName}"));
+					string sql = $"UPDATE {schemaName}.{tableName} SET {updateAssignments} WHERE {primaryKeyColumn.ColumnName} = @{primaryKeyColumn.ColumnName}";
+					using (var command = new SqlCommand(sql, connection)) {
+						AddParametersToCommand(command, validColumns, row, dtColumns);
+						int rowsAffected = await command.ExecuteNonQueryAsync();
+						if (rowsAffected == 0)
+							throw new Exception("No records were updated. Record not found or data unchanged.");
 					}
+				}
+			} catch (SqlException ex) {
+				throw new Exception($"SQL Server error during update: {ex.Message}", ex);
+			} catch (Exception ex) {
+				throw new Exception($"Error updating record in SQL Server: {ex.Message}", ex);
+			}
+		}
 
-					// Build the SQL INSERT statement
-					var columnNames = string.Join(", ", validColumns.Select(c => c.ColumnName));
+		public async Task InsertRecordAsync(DataTable dataTable, string schemaName = "sfo") {
+			if (dataTable == null || dataTable.Rows.Count == 0) throw new ArgumentException("DataTable is empty or null.");
+			string tableName = dataTable.TableName;
+			try {
+				using (var connection = new SqlConnection(_connectionString)) {
+					await connection.OpenAsync();
+					DataTable schemaTable = await getTableSchemaAsync(connection, tableName);// Retrieve schema using ftSfoSchema function
+					DataRow row = dataTable.Rows[0];// Get the first row from DataTable
+					var dtColumns = dataTable.Columns.Cast<DataColumn>()// Map DataTable columns to SQL Server schema (case-insensitive)
+						.Select(col => col.ColumnName).ToList();
+					var validColumns = schemaTable.AsEnumerable()
+						.Where(s => dtColumns.Any(dtCol => dtCol.Equals(s.Field<string>("COLUMN_NAME"), StringComparison.OrdinalIgnoreCase)))
+						.Select(s => new ColumnMetadata {
+							ColumnName = s.Field<string>("COLUMN_NAME"),
+							DataType = s.Field<string>("DATA_TYPE"),
+							IsNullable = s.Field<string>("IS_NULLABLE") == "YES",
+							MaxLength = s.IsNull("CHARACTER_MAXIMUM_LENGTH") ? -1 : s.Field<int>("CHARACTER_MAXIMUM_LENGTH")
+						}).ToList();
+					if (!validColumns.Any()) throw new Exception("No matching columns found between DataTable and SQL Server table schema.");
+					var columnNames = string.Join(", ", validColumns.Select(c => c.ColumnName));// Build the SQL INSERT statement
 					var parameterNames = string.Join(", ", validColumns.Select(c => $"@{c.ColumnName}"));
 					string sql = $"INSERT INTO {schemaName}.{tableName} ({columnNames}) VALUES ({parameterNames})";
-
 					using (var command = new SqlCommand(sql, connection)) {
-						// Add parameters using the reusable method
-						AddParametersToCommand(command, validColumns, row, dtColumns);
-
-						// Execute the insert
+						AddParametersToCommand(command, validColumns, row, dtColumns);// Add parameters using the reusable method
 						await command.ExecuteNonQueryAsync();
 					}
 				}
@@ -488,88 +532,102 @@ namespace mySalesforce {
 				throw new Exception($"Error inserting record into SQL Server: {ex.Message}", ex);
 			}
 		}
-
-
 		#region helpers (private)
-
 		private void AddParametersToCommand(SqlCommand command, List<ColumnMetadata> validColumns, DataRow row, List<string> dtColumns) {
-			validColumns.ForEach(col => {
-				var dtColName = dtColumns.FirstOrDefault(c => c.Equals(col.ColumnName, StringComparison.OrdinalIgnoreCase));
+			foreach (var col in validColumns) {
+				// Find matching DataTable column (case-insensitive)
+				var dtColName = dtColumns.FirstOrDefault(c => c.Equals(col.ColumnName, StringComparison.OrdinalIgnoreCase))
+					?? throw new Exception($"Column {col.ColumnName} not found in DataTable.");
+
 				object value = row[dtColName];
 
-				// Handle nullability
+				// Handle null values
 				if (value == null || value == DBNull.Value) {
-					if (!col.IsNullable) {
+					if (!col.IsNullable)
 						throw new Exception($"Column {col.ColumnName} is not nullable but received a null value.");
-					}
-					command.Parameters.AddWithValue($"@{col.ColumnName}", DBNull.Value);
-					return;
+					command.Parameters.Add(new SqlParameter($"@{col.ColumnName}", SqlDbType.NVarChar) { Value = DBNull.Value });
+					continue;
 				}
 
-				// Handle data type conversion and length validation
+				// Handle data type conversion and validation
 				switch (col.DataType.ToLower()) {
 					case "varchar":
 					case "nvarchar":
 					string stringValue = value.ToString();
-					if (col.MaxLength > 0 && stringValue.Length > col.MaxLength) {
+					if (col.MaxLength > 0 && stringValue.Length > col.MaxLength)
 						throw new Exception($"Value for {col.ColumnName} exceeds maximum length of {col.MaxLength}.");
-					}
-					command.Parameters.AddWithValue($"@{col.ColumnName}", stringValue);
+					command.Parameters.Add(new SqlParameter($"@{col.ColumnName}", SqlDbType.NVarChar, col.MaxLength) { Value = stringValue });
 					break;
+
 					case "int":
-					if (!int.TryParse(value.ToString(), out int intValue)) {
+					if (!int.TryParse(value.ToString(), out int intValue))
 						throw new Exception($"Cannot convert value for {col.ColumnName} to int.");
-					}
-					command.Parameters.AddWithValue($"@{col.ColumnName}", intValue);
+					command.Parameters.Add(new SqlParameter($"@{col.ColumnName}", SqlDbType.Int) { Value = intValue });
 					break;
+
 					case "bigint":
-					if (!long.TryParse(value.ToString(), out long longValue)) {
+					if (!long.TryParse(value.ToString(), out long longValue))
 						throw new Exception($"Cannot convert value for {col.ColumnName} to bigint.");
-					}
-					command.Parameters.AddWithValue($"@{col.ColumnName}", longValue);
+					if (longValue < 0)
+						throw new Exception($"Unix epoch timestamp for {col.ColumnName} cannot be negative.");
+					command.Parameters.Add(new SqlParameter($"@{col.ColumnName}", SqlDbType.BigInt) { Value = longValue });
 					break;
+
 					case "decimal":
 					case "numeric":
-					if (!decimal.TryParse(value.ToString(), out decimal decimalValue)) {
+					if (!decimal.TryParse(value.ToString(), out decimal decimalValue))
 						throw new Exception($"Cannot convert value for {col.ColumnName} to decimal.");
-					}
-					command.Parameters.AddWithValue($"@{col.ColumnName}", decimalValue);
+					command.Parameters.Add(new SqlParameter($"@{col.ColumnName}", SqlDbType.Decimal) { Value = decimalValue });
 					break;
+
 					case "float":
 					string floatString = value.ToString();
-					if (floatString == "") {
-						if (!col.IsNullable) {
+					if (string.IsNullOrEmpty(floatString)) {
+						if (!col.IsNullable)
 							throw new Exception($"Column {col.ColumnName} is not nullable but received an empty string.");
-						}
-						command.Parameters.AddWithValue($"@{col.ColumnName}", DBNull.Value);
+						command.Parameters.Add(new SqlParameter($"@{col.ColumnName}", SqlDbType.Float) { Value = DBNull.Value });
 					} else {
-						if (!double.TryParse(floatString, out double doubleValue)) {
+						if (!double.TryParse(floatString, out double doubleValue))
 							throw new Exception($"Cannot convert value for {col.ColumnName} to float.");
-						}
-						command.Parameters.AddWithValue($"@{col.ColumnName}", doubleValue);
+						command.Parameters.Add(new SqlParameter($"@{col.ColumnName}", SqlDbType.Float) { Value = doubleValue });
 					}
 					break;
+
 					case "datetime":
 					case "date":
-					command.Parameters.AddWithValue($"@{col.ColumnName}", DateTime.TryParse(value?.ToString(), out DateTime parsedDate) ? parsedDate : DBNull.Value);
+					if (long.TryParse(value?.ToString(), out long unixMillis) && unixMillis >= 0) {
+						// Convert Unix epoch milliseconds to DateTime (UTC)
+						DateTime epochStart = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+						DateTime parsedDate = epochStart.AddMilliseconds(unixMillis);
+						command.Parameters.Add(new SqlParameter($"@{col.ColumnName}", SqlDbType.DateTime) { Value = parsedDate });
+					} else if (DateTime.TryParse(value?.ToString(), out DateTime parsedDateFromString)) {
+						// Handle string-based DateTime parsing
+						command.Parameters.Add(new SqlParameter($"@{col.ColumnName}", SqlDbType.DateTime) { Value = parsedDateFromString });
+					} else {
+						// Handle invalid or null values
+						command.Parameters.Add(new SqlParameter($"@{col.ColumnName}", SqlDbType.DateTime) { Value = DBNull.Value });
+					}
 					break;
 					case "bit":
-					if (!bool.TryParse(value.ToString(), out bool boolValue)) {
+					if (!bool.TryParse(value.ToString(), out bool boolValue))
 						throw new Exception($"Cannot convert value for {col.ColumnName} to bit.");
-					}
-					command.Parameters.AddWithValue($"@{col.ColumnName}", boolValue);
+					command.Parameters.Add(new SqlParameter($"@{col.ColumnName}", SqlDbType.Bit) { Value = boolValue });
 					break;
+
 					case "uniqueidentifier":
-					if (!Guid.TryParse(value.ToString(), out Guid guidValue)) {
+					if (!Guid.TryParse(value.ToString(), out Guid guidValue))
 						throw new Exception($"Cannot convert value for {col.ColumnName} to uniqueidentifier.");
-					}
-					command.Parameters.AddWithValue($"@{col.ColumnName}", guidValue);
+					command.Parameters.Add(new SqlParameter($"@{col.ColumnName}", SqlDbType.UniqueIdentifier) { Value = guidValue });
 					break;
+
 					default:
-					command.Parameters.AddWithValue($"@{col.ColumnName}", value.ToString());
+					command.Parameters.Add(new SqlParameter($"@{col.ColumnName}", SqlDbType.NVarChar) { Value = value.ToString() });
 					break;
 				}
-			});
+
+				// Optional: Log parameter for debugging (remove in production)
+				// Console.WriteLine($"Parameter @{col.ColumnName}: {command.Parameters[$"@{col.ColumnName}"].Value}");
+			}
 		}
 
 		private async Task<DataTable> getTableSchemaAsync(SqlConnection connection, string tableName) {
@@ -582,8 +640,6 @@ namespace mySalesforce {
 			if (schemaTable.Rows.Count == 0) throw new Exception($"No schema found for table {tableName} in schema sfo.");
 			return schemaTable;
 		}
-
-
 		private static string mapToSqlType(string salesforceType, int length, string columnName) {
 			return salesforceType.ToLower() switch {
 				"string" => length > 0 && length <= 8000 ? $"VARCHAR({length})" : "NVARCHAR(MAX)",
@@ -758,5 +814,29 @@ public static class SqlServerLibExtensions {
 		ds.DataSetName = "X";
 		return ds.GetXml();
 	}
+
+	public static DataTable Transpose(this DataTable inputTable) {
+		if (inputTable == null || inputTable.Rows.Count == 0)
+			return new DataTable();
+		DataTable transposedTable = new DataTable(inputTable.TableName);
+		inputTable.AsEnumerable()
+			.Select(row => row["FieldName"]?.ToString())
+			.Where(fieldName => !string.IsNullOrEmpty(fieldName) && !transposedTable.Columns.Contains(fieldName))
+			.ToList()
+			.ForEach(fieldName => transposedTable.Columns.Add(fieldName));
+		DataRow newRow = transposedTable.NewRow();
+		inputTable.AsEnumerable()
+			.Select(row => new {
+				FieldName = row["FieldName"]?.ToString(),
+				FieldValue = row["Value"]?.ToString()
+			})
+			.Where(x => !string.IsNullOrEmpty(x.FieldName) && transposedTable.Columns.Contains(x.FieldName))
+			.ToList()
+			.ForEach(x => newRow[x.FieldName] = x.FieldValue);
+		transposedTable.Rows.Add(newRow);
+
+		return transposedTable;
+	}
+
 }
 #endregion Extensions
