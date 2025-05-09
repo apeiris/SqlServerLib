@@ -689,60 +689,48 @@ public static class SqlServerLibExtensions {
 	}
 	public static string GenerateDDL(this DataSet dataSet) {
 		StringBuilder ddl = new StringBuilder();
-
 		// Drop tables if they exist (in reverse order to avoid FK conflicts)
 		for (int i = dataSet.Tables.Count - 1; i >= 0; i--) {
 			var table = dataSet.Tables[i];
 			ddl.AppendLine($"IF OBJECT_ID('{table.TableName}', 'U') IS NOT NULL DROP TABLE {table.TableName};");
 		}
-
 		// Create tables
 		foreach (DataTable table in dataSet.Tables) {
 			ddl.AppendLine($"CREATE TABLE {table.TableName} (");
-
 			// Columns
 			for (int i = 0; i < table.Columns.Count; i++) {
 				var column = table.Columns[i];
 				string columnDef = $"    {column.ColumnName} {GetSqlDataType(column)}";
-
 				// Handle defaults
 				if (column.DefaultValue != DBNull.Value && column.DefaultValue != null) {
 					string defaultValue = FormatDefaultValue(column);
 					columnDef += $" DEFAULT {defaultValue}";
 				}
-
 				// Handle nullability
 				if (!column.AllowDBNull && !IsPrimaryKey(column, table)) {
 					columnDef += " NOT NULL";
 				}
-
 				if (i < table.Columns.Count - 1)
 					columnDef += ",";
-
 				ddl.AppendLine(columnDef);
 			}
-
 			// Primary Key
 			if (table.PrimaryKey.Length > 0) {
 				var pkColumns = string.Join(", ", Array.ConvertAll(table.PrimaryKey, c => c.ColumnName));
 				ddl.AppendLine($"    CONSTRAINT PK_{table.TableName} PRIMARY KEY ({pkColumns})");
 			}
-
 			ddl.AppendLine(");");
 		}
-
 		// Foreign Keys
 		foreach (DataRelation relation in dataSet.Relations) {
 			var parentTable = relation.ParentTable.TableName;
 			var childTable = relation.ChildTable.TableName;
 			var parentColumn = relation.ParentColumns[0].ColumnName;
 			var childColumn = relation.ChildColumns[0].ColumnName;
-
 			ddl.AppendLine($"ALTER TABLE {childTable}");
 			ddl.AppendLine($"ADD CONSTRAINT FK_{childTable}_{parentTable} FOREIGN KEY ({childColumn})");
 			ddl.AppendLine($"REFERENCES {parentTable} ({parentColumn});");
 		}
-
 		return ddl.ToString();
 	}
 	static string FormatDefaultValue(DataColumn column) {
@@ -765,13 +753,7 @@ public static class SqlServerLibExtensions {
 	public static string GetXml(this DataTable table, string ColumnsToSelect) {
 		DataTable tblClipped = table.DefaultView.ToTable(true, ColumnsToSelect.Split(','));
 		tblClipped.TableName = table.TableName;
-
-
-
 		DataSet ds = new DataSet();
-
-
-
 		ds.Tables.Add(tblClipped.Copy());
 		ds.DataSetName = "X";
 		return ds.GetXml();
