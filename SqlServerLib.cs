@@ -53,6 +53,13 @@ namespace mySalesforce {
 		}
 	}
 	#endregion event args
+
+	public class ColumnMetadata {
+		public string ColumnName { get; set; }
+		public string DataType { get; set; }
+		public bool IsNullable { get; set; }
+		public int MaxLength { get; set; }
+	}
 	public class SqlServerLib {
 		private readonly string? _connectionString;
 		private readonly ILogger<SqlServerLib> _l;
@@ -218,7 +225,7 @@ namespace mySalesforce {
 			var whereClause = $"{_keyName} = '{whereValue?.Replace("'", "''")}'";
 			return (setClause, whereClause);
 		}
-		
+
 		public string GenerateCreateTableScript(DataTable schema, string schemaName, string tableName) {
 			StringBuilder sql = new StringBuilder();
 			// Add IF NOT EXISTS check
@@ -349,11 +356,11 @@ namespace mySalesforce {
 				RaisSqlEvent($"Error: {ex.Message}\n{ex.StackTrace}", SqlEvents.Exception, LogLevel.Error, true);
 			}
 		}
+		/*
 		public async Task InsertRecordAsync(DataTable dataTable, string schemaName = "sfo") {
 			if (dataTable == null || dataTable.Rows.Count == 0) {
 				throw new ArgumentException("DataTable is empty or null.");
 			}
-
 			try {
 				string tableName = dataTable.TableName;
 				using (var connection = new SqlConnection(_connectionString)) {
@@ -373,7 +380,6 @@ namespace mySalesforce {
 						})
 						.ToList();
 					if (!validColumns.Any()) throw new Exception("No matching columns found between DataTable and SQL Server table schema.");
-
 					var columnNames = string.Join(", ", validColumns.Select(c => c.ColumnName));
 					var parameterNames = string.Join(", ", validColumns.Select(c => $"@{c.ColumnName}"));
 					string sql = $"INSERT INTO sfo.{tableName} ({columnNames}) VALUES ({parameterNames})";
@@ -425,15 +431,155 @@ namespace mySalesforce {
 				throw new Exception($"Error inserting record into SQL Server: {ex.Message}", ex);
 			}
 		}
+		*/
+
+		public async Task InsertRecordAsync(DataTable dataTable, string schemaName = "sfo") {
+			if (dataTable == null || dataTable.Rows.Count == 0) {
+				throw new ArgumentException("DataTable is empty or null.");
+			}
+
+			string tableName = dataTable.TableName;
+
+			try {
+				using (var connection = new SqlConnection(_connectionString)) {
+					await connection.OpenAsync();
+
+					// Retrieve schema using ftSfoSchema function
+					DataTable schemaTable = await getTableSchemaAsync(connection, tableName);
+
+					// Get the first row from DataTable
+					DataRow row = dataTable.Rows[0];
+
+					// Map DataTable columns to SQL Server schema (case-insensitive)
+					var dtColumns = dataTable.Columns.Cast<DataColumn>()
+						.Select(col => col.ColumnName)
+						.ToList();
+
+					var validColumns = schemaTable.AsEnumerable()
+						.Where(s => dtColumns.Any(dtCol => dtCol.Equals(s.Field<string>("COLUMN_NAME"), StringComparison.OrdinalIgnoreCase)))
+						.Select(s => new ColumnMetadata {
+							ColumnName = s.Field<string>("COLUMN_NAME"),
+							DataType = s.Field<string>("DATA_TYPE"),
+							IsNullable = s.Field<string>("IS_NULLABLE") == "YES",
+							MaxLength = s.IsNull("CHARACTER_MAXIMUM_LENGTH") ? -1 : s.Field<int>("CHARACTER_MAXIMUM_LENGTH")
+						})
+						.ToList();
+
+					if (!validColumns.Any()) {
+						throw new Exception("No matching columns found between DataTable and SQL Server table schema.");
+					}
+
+					// Build the SQL INSERT statement
+					var columnNames = string.Join(", ", validColumns.Select(c => c.ColumnName));
+					var parameterNames = string.Join(", ", validColumns.Select(c => $"@{c.ColumnName}"));
+					string sql = $"INSERT INTO {schemaName}.{tableName} ({columnNames}) VALUES ({parameterNames})";
+
+					using (var command = new SqlCommand(sql, connection)) {
+						// Add parameters using the reusable method
+						AddParametersToCommand(command, validColumns, row, dtColumns);
+
+						// Execute the insert
+						await command.ExecuteNonQueryAsync();
+					}
+				}
+			} catch (SqlException ex) {
+				throw new Exception($"SQL Server error during insert: {ex.Message}", ex);
+			} catch (Exception ex) {
+				throw new Exception($"Error inserting record into SQL Server: {ex.Message}", ex);
+			}
+		}
+
+
 		#region helpers (private)
+
+		private void AddParametersToCommand(SqlCommand command, List<ColumnMetadata> validColumns, DataRow row, List<string> dtColumns) {
+			validColumns.ForEach(col => {
+				var dtColName = dtColumns.FirstOrDefault(c => c.Equals(col.ColumnName, StringComparison.OrdinalIgnoreCase));
+				object value = row[dtColName];
+
+				// Handle nullability
+				if (value == null || value == DBNull.Value) {
+					if (!col.IsNullable) {
+						throw new Exception($"Column {col.ColumnName} is not nullable but received a null value.");
+					}
+					command.Parameters.AddWithValue($"@{col.ColumnName}", DBNull.Value);
+					return;
+				}
+
+				// Handle data type conversion and length validation
+				switch (col.DataType.ToLower()) {
+					case "varchar":
+					case "nvarchar":
+					string stringValue = value.ToString();
+					if (col.MaxLength > 0 && stringValue.Length > col.MaxLength) {
+						throw new Exception($"Value for {col.ColumnName} exceeds maximum length of {col.MaxLength}.");
+					}
+					command.Parameters.AddWithValue($"@{col.ColumnName}", stringValue);
+					break;
+					case "int":
+					if (!int.TryParse(value.ToString(), out int intValue)) {
+						throw new Exception($"Cannot convert value for {col.ColumnName} to int.");
+					}
+					command.Parameters.AddWithValue($"@{col.ColumnName}", intValue);
+					break;
+					case "bigint":
+					if (!long.TryParse(value.ToString(), out long longValue)) {
+						throw new Exception($"Cannot convert value for {col.ColumnName} to bigint.");
+					}
+					command.Parameters.AddWithValue($"@{col.ColumnName}", longValue);
+					break;
+					case "decimal":
+					case "numeric":
+					if (!decimal.TryParse(value.ToString(), out decimal decimalValue)) {
+						throw new Exception($"Cannot convert value for {col.ColumnName} to decimal.");
+					}
+					command.Parameters.AddWithValue($"@{col.ColumnName}", decimalValue);
+					break;
+					case "float":
+					string floatString = value.ToString();
+					if (floatString == "") {
+						if (!col.IsNullable) {
+							throw new Exception($"Column {col.ColumnName} is not nullable but received an empty string.");
+						}
+						command.Parameters.AddWithValue($"@{col.ColumnName}", DBNull.Value);
+					} else {
+						if (!double.TryParse(floatString, out double doubleValue)) {
+							throw new Exception($"Cannot convert value for {col.ColumnName} to float.");
+						}
+						command.Parameters.AddWithValue($"@{col.ColumnName}", doubleValue);
+					}
+					break;
+					case "datetime":
+					case "date":
+					command.Parameters.AddWithValue($"@{col.ColumnName}", DateTime.TryParse(value?.ToString(), out DateTime parsedDate) ? parsedDate : DBNull.Value);
+					break;
+					case "bit":
+					if (!bool.TryParse(value.ToString(), out bool boolValue)) {
+						throw new Exception($"Cannot convert value for {col.ColumnName} to bit.");
+					}
+					command.Parameters.AddWithValue($"@{col.ColumnName}", boolValue);
+					break;
+					case "uniqueidentifier":
+					if (!Guid.TryParse(value.ToString(), out Guid guidValue)) {
+						throw new Exception($"Cannot convert value for {col.ColumnName} to uniqueidentifier.");
+					}
+					command.Parameters.AddWithValue($"@{col.ColumnName}", guidValue);
+					break;
+					default:
+					command.Parameters.AddWithValue($"@{col.ColumnName}", value.ToString());
+					break;
+				}
+			});
+		}
+
 		private async Task<DataTable> getTableSchemaAsync(SqlConnection connection, string tableName) {
 			var schemaTable = new DataTable();
 			string sql = "SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE FROM dbo.ftSfoSchema(@TableName)";
 			using (var command = new SqlCommand(sql, connection)) {
 				command.Parameters.AddWithValue("@TableName", tableName);
-				using (var adapter = new SqlDataAdapter(command)) 	adapter.Fill(schemaTable);
+				using (var adapter = new SqlDataAdapter(command)) adapter.Fill(schemaTable);
 			}
-			if (schemaTable.Rows.Count == 0) 	throw new Exception($"No schema found for table {tableName} in schema sfo.");
+			if (schemaTable.Rows.Count == 0) throw new Exception($"No schema found for table {tableName} in schema sfo.");
 			return schemaTable;
 		}
 
