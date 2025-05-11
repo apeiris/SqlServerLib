@@ -164,7 +164,7 @@ namespace mySalesforce {
 				}
 			} catch (SqlException ex) {
 				//RaisSqlEvent($"SQL Error:{ex.Message}",SqlEvents.SqlException, LogLevel.Error);
-				RaisSqlEvent($"SQL Error:{ex.Message}", SqlEvents.SqlException, LogLevel.Error, true);
+				RaisSqlEvent($"SQL Error:{script}\r\n {ex.Message}", SqlEvents.SqlException, LogLevel.Error, true);
 
 			} catch (Exception ex) {
 				RaisSqlEvent($"Error:{ex.Message}", SqlEvents.Exception, LogLevel.Error, true);
@@ -242,7 +242,7 @@ namespace mySalesforce {
 				string salesforceType = row["Type"].ToString();
 				int length = Convert.ToInt32(row["Length"]);
 				string sqlType = mapToSqlType(salesforceType, length, name);
-				string nullability = (name == "[Id]" || salesforceType == "boolean" || salesforceType == "datetime") ? "NOT NULL" : "NULL";
+				string nullability = row["Nullable"].ToString() == "true" ? "NULL" : "NOT NULL";
 				string columnDefinition = $"{name} {sqlType} {nullability}";
 				sql.Append($"        {columnDefinition}");
 				if (i < schema.Rows.Count - 1 || schema.Columns.Contains("Id"))
@@ -325,7 +325,7 @@ namespace mySalesforce {
 			using (SqlConnection conn = new SqlConnection(_connectionString)) {
 				conn.Open();
 				try {
-					using (SqlCommand cmd = new SqlCommand($"SELECT COUNT(*) FROM {schemaName}.{ObjectName} WHERE Id = @Id", conn)) {
+					using (SqlCommand cmd = new SqlCommand($"SELECT COUNT(*) FROM {schemaName}.[{ObjectName}] WHERE Id = @Id", conn)) {
 						cmd.Parameters.AddWithValue("@Id", recordId);
 						int count = (int)cmd.ExecuteScalar();
 						return count > 0;
@@ -484,7 +484,7 @@ namespace mySalesforce {
 					var updateAssignments = string.Join(", ", validColumns
 						.Skip(1) // Skip primary key column for updates
 						.Select(c => $"{c.ColumnName} = @{c.ColumnName}"));
-					string sql = $"UPDATE {schemaName}.{tableName} SET {updateAssignments} WHERE {primaryKeyColumn.ColumnName} = @{primaryKeyColumn.ColumnName}";
+					string sql = $"UPDATE {schemaName}.[{tableName}] SET {updateAssignments} WHERE {primaryKeyColumn.ColumnName} = @{primaryKeyColumn.ColumnName}";
 					using (var command = new SqlCommand(sql, connection)) {
 						AddParametersToCommand(command, validColumns, row, dtColumns);
 						int rowsAffected = await command.ExecuteNonQueryAsync();
@@ -520,14 +520,14 @@ namespace mySalesforce {
 					if (!validColumns.Any()) throw new Exception("No matching columns found between DataTable and SQL Server table schema.");
 					var columnNames = string.Join(", ", validColumns.Select(c => c.ColumnName));// Build the SQL INSERT statement
 					var parameterNames = string.Join(", ", validColumns.Select(c => $"@{c.ColumnName}"));
-					string sql = $"INSERT INTO {schemaName}.{tableName} ({columnNames}) VALUES ({parameterNames})";
+					string sql = $"INSERT INTO {schemaName}.[{tableName}] ({columnNames}) VALUES ({parameterNames})";
 					using (var command = new SqlCommand(sql, connection)) {
 						AddParametersToCommand(command, validColumns, row, dtColumns);// Add parameters using the reusable method
 						await command.ExecuteNonQueryAsync();
 					}
 				}
 			} catch (SqlException ex) {
-				throw new Exception($"SQL Server error during insert: {ex.Message}", ex);
+				throw new Exception($"SQL Server error during insert: {ex.Message}\r\n{ex.StackTrace}", ex);
 			} catch (Exception ex) {
 				throw new Exception($"Error inserting record into SQL Server: {ex.Message}", ex);
 			}
@@ -815,20 +815,20 @@ public static class SqlServerLibExtensions {
 		return ds.GetXml();
 	}
 
-	public static DataTable Transpose(this DataTable inputTable) {
+	public static DataTable Transpose(this DataTable inputTable,string rowLabel="FieldName",string contentLabel="Value") {
 		if (inputTable == null || inputTable.Rows.Count == 0)
 			return new DataTable();
 		DataTable transposedTable = new DataTable(inputTable.TableName);
 		inputTable.AsEnumerable()
-			.Select(row => row["FieldName"]?.ToString())
+			.Select(row => row[rowLabel]?.ToString())
 			.Where(fieldName => !string.IsNullOrEmpty(fieldName) && !transposedTable.Columns.Contains(fieldName))
 			.ToList()
 			.ForEach(fieldName => transposedTable.Columns.Add(fieldName));
 		DataRow newRow = transposedTable.NewRow();
 		inputTable.AsEnumerable()
 			.Select(row => new {
-				FieldName = row["FieldName"]?.ToString(),
-				FieldValue = row["Value"]?.ToString()
+				FieldName = row[rowLabel]?.ToString(),
+				FieldValue = row[contentLabel]?.ToString()
 			})
 			.Where(x => !string.IsNullOrEmpty(x.FieldName) && transposedTable.Columns.Contains(x.FieldName))
 			.ToList()
