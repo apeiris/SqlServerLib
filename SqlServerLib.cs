@@ -253,7 +253,8 @@ namespace NetUtils {
 				int length = Convert.ToInt32(row["Length"]);
 				string sqlType = mapToSqlType(salesforceType, length, name);
 				string nullability = row["Nullable"].ToString() == "true" ? "NULL" : "NOT NULL";
-				string columnDefinition = $"{name} {sqlType} {nullability}";
+				string dflt = row["Default"] != "" ? $"DEFAULT {row["Default"]}":"";
+				string columnDefinition = $"{name} {sqlType} {nullability} {dflt}";
 				sql.Append($"        {columnDefinition}");
 				if (i < schema.Rows.Count - 1 || schema.Columns.Contains("Id"))
 					sql.Append(",");
