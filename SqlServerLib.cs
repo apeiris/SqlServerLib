@@ -56,7 +56,6 @@ namespace NetUtils {
 		}
 	}
 	#endregion event args
-
 	public class ColumnMetadata {
 		public string ColumnName { get; set; }
 		public string DataType { get; set; }
@@ -545,7 +544,6 @@ namespace NetUtils {
 	}
 	#endregion	Public Methods
 }
-
 #region Extensions
 public static class SqlServerLibExtensions {
 	public static void AddIdentityColumn(this DataTable table,
