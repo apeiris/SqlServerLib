@@ -79,7 +79,6 @@ namespace NetUtils {
 		}
 		private void RaisSqlObjectExist(int objectId, string objectName, string objectType, bool exists, string query, [CallerMemberName] string mn = "", [CallerLineNumber] int ln = 0) {
 			string msg = $"{objectName}:{objectType}:{objectId}:{exists}:{mn}:{ln}";
-
 			SqlObjectExist?.Invoke(this, new SqlObjectQuery(objectName, objectType, objectId, exists, query, msg));
 		}
 		#region SqlServerLib.ctor
@@ -98,7 +97,6 @@ namespace NetUtils {
 			string sql = $"SELECT  {columnList(dtTransposed)} FROM sfo.[{dtTransposed.TableName}] where {dtTransposed.PrimaryKey.FirstOrDefault()?.ColumnName}='{e.RecordIds[0]}';";
 			//UpdateServerTable(dtTransposed, sql);
 			enmIsTo isto = (enmIsTo)Enum.Parse(typeof(enmIsTo), e.ChangeType, ignoreCase: true);
-
 			UpdateOrInsertRecordAsync(dtTransposed, e.RecordIds[0], isto);
 		}
 		#endregion SqlServerLib.ctor
@@ -195,51 +193,6 @@ namespace NetUtils {
 				RaisSqlEvent($"Error:{ex.Message}", SqlEvents.Exception, LogLevel.Error, true);
 			}
 		}
-		private string queryStringsForInsert(DataTable dt) {
-			var rows = dt.AsEnumerable();
-
-			// Get column names and formatted values
-			var columns = rows.Select(r => r["FieldName"].ToString()).ToList();
-			var values = rows.Select(r => {
-				var value = r["Value"]?.ToString();
-				var dataType = r["DataType"]?.ToString();
-
-				// Handle value formatting based on DataType using switch
-				return dataType switch {
-					"DateTime" when long.TryParse(value, out long unixTimestamp) =>
-						// Convert Unix timestamp (milliseconds) to SQL DateTime
-						$"'{DateTimeOffset.FromUnixTimeMilliseconds(unixTimestamp).UtcDateTime.ToString("yyyy-MM-dd HH:mm:ss")}'",
-					_ => $"'{value?.Replace("'", "''")}'" // Default case: escape single quotes
-				};
-			}).ToList();
-
-			// Construct INSERT statement
-			var columnsClause = string.Join(", ", columns);
-			var valuesClause = string.Join(", ", values);
-			return $"INSERT INTO {dt.TableName} ({columnsClause}) VALUES ({valuesClause})";
-		}
-		private (string _setClause, string _whereClause) queryStringsforUpdate(DataTable dt, string _keyName = "Id") {
-			var rows = dt.AsEnumerable();
-			var setClause = string.Join(", ", rows
-				.Where(r => !string.Equals(r["FieldName"].ToString(), _keyName, StringComparison.OrdinalIgnoreCase))
-				.Select(r => {
-					var field = r["FieldName"].ToString();
-					var value = r["Value"]?.ToString();
-					var dataType = r["DataType"]?.ToString();
-					value = dataType switch {   // Handle value formatting based on DataType using switch
-						"DateTime" when long.TryParse(value, out long unixTimestamp) =>
-							DateTimeOffset.FromUnixTimeMilliseconds(unixTimestamp)  // Convert Unix timestamp (milliseconds) to SQL DateTime
-								.UtcDateTime
-								.ToString("yyyy-MM-dd HH:mm:ss"),
-						_ => value?.Replace("'", "''") // Default case: escape single quotes
-					};
-					return $"{field} = '{value}'";
-				}));
-			var whereValue = rows
-				.FirstOrDefault(r => string.Equals(r["FieldName"].ToString(), _keyName, StringComparison.OrdinalIgnoreCase))?["Value"]?.ToString();
-			var whereClause = $"{_keyName} = '{whereValue?.Replace("'", "''")}'";
-			return (setClause, whereClause);
-		}
 		public string GenerateCreateTableScript(DataTable schema, string schemaName, string tableName) {
 			StringBuilder sql = new StringBuilder();
 			sql.AppendLine($"IF NOT EXISTS (SELECT * FROM sys.tables t JOIN sys.schemas s ON t.schema_id = s.schema_id WHERE t.name = '{tableName}' AND s.name = '{schemaName}')");
@@ -273,7 +226,6 @@ namespace NetUtils {
 			sql.AppendLine("END");
 			return sql.ToString();
 		}
-
 		public List<string> GetChangeEventUrls(DataTable sfoTables) {
 			return sfoTables.AsEnumerable()
 			.Select(row => {
@@ -284,7 +236,6 @@ namespace NetUtils {
 			.OrderBy(name => name)
 			.ToList();
 		}
-
 		public (int RowsInserted, string TableName) RegisterExludedCDCFields(string xml) {
 			if (string.IsNullOrWhiteSpace(xml))
 				throw new ArgumentException("XML input cannot be empty.", nameof(xml));
@@ -378,16 +329,11 @@ namespace NetUtils {
 				if (!AssertRecord(dataTable.TableName, dataTable.Rows[0]["Id"].ToString()!, dBschemaName)) {
 					DataTable dt = await _salesforceService.GetSalesforceRecord(dataTable.TableName, recordId);
 				await InsertRecordAsync(dt, dBschemaName);
-
 				}
-				
 			} else {
 				throw new Exception($"Record with Id {dataTable.Rows[0]["Id"]} does not exist in table {dataTable.TableName}.");
 			}
-
-	
-			if (dataTable == null || dataTable.Rows.Count == 0)
-				throw new ArgumentException("DataTable is empty or null.");
+			if (dataTable == null || dataTable.Rows.Count == 0) throw new ArgumentException("DataTable is empty or null.");
 			string tableName = dataTable.TableName;
 			try {
 				using (var connection = new SqlConnection(_connectionString)) {
@@ -404,8 +350,7 @@ namespace NetUtils {
 							IsNullable = s.Field<string>("IS_NULLABLE") == "YES",
 							MaxLength = s.IsNull("CHARACTER_MAXIMUM_LENGTH") ? -1 : s.Field<int>("CHARACTER_MAXIMUM_LENGTH")
 						}).ToList();
-					if (!validColumns.Any())
-						throw new Exception("No matching columns found between DataTable and SQL Server table schema.");
+					if (!validColumns.Any()) throw new Exception("No matching columns found between DataTable and SQL Server table schema.");
 					var primaryKeyColumn = validColumns.First();
 					var updateAssignments = string.Join(", ", validColumns
 						.Skip(1) // Skip primary key column for updates
@@ -418,14 +363,12 @@ namespace NetUtils {
 							throw new Exception("No records were updated. Record not found or data unchanged.");
 					}
 				}
-
 			} catch (SqlException ex) {
 				throw new Exception($"SQL Server error during update: {ex.Message}", ex);
 			} catch (Exception ex) {
 				throw new Exception($"Error updating record in SQL Server: {ex.Message}", ex);
 			}
 		}
-
 		public async Task InsertRecordAsync(DataTable dataTable, string schemaName = "sfo") {
 			if (dataTable == null || dataTable.Rows.Count == 0) throw new ArgumentException("DataTable is empty or null.");
 			string tableName = dataTable.TableName;
@@ -456,7 +399,7 @@ namespace NetUtils {
 			} catch (SqlException ex) {
 				throw new Exception($"SQL Server error during insert: {ex.Message}\r\n{ex.StackTrace}", ex);
 			} catch (Exception ex) {
-				throw new Exception($"Error inserting record into SQL Server: {ex.Message}", gex);
+				throw new Exception($"Error inserting record into SQL Server: {ex.Message}", ex);
 			}
 		}
 		#region helpers (private)
