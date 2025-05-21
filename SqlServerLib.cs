@@ -1,6 +1,7 @@
 ﻿using System.Data;
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using DocumentFormat.OpenXml.Drawing;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Configuration;
@@ -66,6 +67,7 @@ namespace NetUtils {
 		private readonly PubSubService _pubSubService;
 		private readonly string? _connectionString;
 		private readonly SqlServerConfig _config;
+		private readonly ISalesforceService _salesforceService;
 		private readonly ILogger<SqlServerLib> _l;
 		private Dictionary<string, string> _queryCache = new Dictionary<string, string>();
 		private readonly string _sqlSchemaName = "sfo";
@@ -81,22 +83,23 @@ namespace NetUtils {
 			SqlObjectExist?.Invoke(this, new SqlObjectQuery(objectName, objectType, objectId, exists, query, msg));
 		}
 		#region SqlServerLib.ctor
-		public SqlServerLib(PubSubService pubSubService, IConfiguration configuration, ILogger<SqlServerLib> logger) {
+		public SqlServerLib(PubSubService pubSubService, ISalesforceService salesforceService, IConfiguration configuration, ILogger<SqlServerLib> logger) {
 			_pubSubService = pubSubService ?? throw new ArgumentNullException(nameof(pubSubService));
 			_connectionString = configuration.GetConnectionString("mssql") ?? throw new ArgumentNullException(nameof(configuration));
 			_sqlSchemaName = configuration.GetSection("Salesforce")["SqlSchemaName"]!;
-
+			_salesforceService = salesforceService ?? throw new ArgumentNullException(nameof(salesforceService));
 			_l = logger ?? throw new ArgumentNullException(nameof(logger));
 			if (string.IsNullOrWhiteSpace(_connectionString))
 				throw new InvalidOperationException("Connection string 'mssql' is missing or empty in configuration.");
-
 			_pubSubService.CDCEvent += _pubSubService_CDCEvent;
-
 		}
 		private void _pubSubService_CDCEvent(object? sender, CDCEventArgs e) {
 			DataTable dtTransposed = e.DeltaFields.Transpose(primaryKey: "Id");//Transpose to row to columnset, and  defaults  FieldName, and Value as columns
 			string sql = $"SELECT  {columnList(dtTransposed)} FROM sfo.[{dtTransposed.TableName}] where {dtTransposed.PrimaryKey.FirstOrDefault()?.ColumnName}='{e.RecordIds[0]}';";
-			UpdateServerTable(dtTransposed, sql);
+			//UpdateServerTable(dtTransposed, sql);
+			enmIsTo isto = (enmIsTo)Enum.Parse(typeof(enmIsTo), e.ChangeType, ignoreCase: true);
+
+			UpdateOrInsertRecordAsync(dtTransposed, e.RecordIds[0], isto);
 		}
 		#endregion SqlServerLib.ctor
 		#region Public Methods
@@ -174,11 +177,8 @@ namespace NetUtils {
 
 				}
 			} catch (SqlException ex) {
-				//RaisSqlEvent($"SQL Error:{ex.Message}",SqlEvents.SqlException, LogLevel.Error);
 				result = -1;
 				RaisSqlEvent($"SQL Error:{script}\r\n {ex.Message}", SqlEvents.SqlException, LogLevel.Error, true);
-
-
 			} catch (Exception ex) {
 				result = -1;
 				RaisSqlEvent($"Error:{ex.Message}", SqlEvents.Exception, LogLevel.Error, true);
@@ -242,18 +242,17 @@ namespace NetUtils {
 		}
 		public string GenerateCreateTableScript(DataTable schema, string schemaName, string tableName) {
 			StringBuilder sql = new StringBuilder();
-			// Add IF NOT EXISTS check
 			sql.AppendLine($"IF NOT EXISTS (SELECT * FROM sys.tables t JOIN sys.schemas s ON t.schema_id = s.schema_id WHERE t.name = '{tableName}' AND s.name = '{schemaName}')");
 			sql.AppendLine("BEGIN");
 			sql.AppendLine($"    CREATE TABLE [{schemaName}].[{tableName}] (");
-			for (int i = 0; i < schema.Rows.Count; i++) {	// Build column definitions from DataRows
+			for (int i = 0; i < schema.Rows.Count; i++) {   // Build column definitions from DataRows
 				DataRow row = schema.Rows[i];
 				string name = $"[{row["Name"].ToString()}]";
 				string salesforceType = row["Type"].ToString();
 				int length = Convert.ToInt32(row["Length"]);
 				string sqlType = mapToSqlType(salesforceType, length, name);
 				string nullability = row["Nullable"].ToString() == "true" ? "NULL" : "NOT NULL";
-				string dflt = row["Default"] != "" ? $"DEFAULT {row["Default"]}":"";
+				string dflt = row["Default"] != "" ? $"DEFAULT {row["Default"]}" : "";
 				string columnDefinition = $"{name} {sqlType} {nullability} {dflt}";
 				sql.Append($"        {columnDefinition}");
 				if (i < schema.Rows.Count - 1 || schema.Columns.Contains("Id"))
@@ -274,6 +273,7 @@ namespace NetUtils {
 			sql.AppendLine("END");
 			return sql.ToString();
 		}
+
 		public List<string> GetChangeEventUrls(DataTable sfoTables) {
 			return sfoTables.AsEnumerable()
 			.Select(row => {
@@ -284,6 +284,7 @@ namespace NetUtils {
 			.OrderBy(name => name)
 			.ToList();
 		}
+
 		public (int RowsInserted, string TableName) RegisterExludedCDCFields(string xml) {
 			if (string.IsNullOrWhiteSpace(xml))
 				throw new ArgumentException("XML input cannot be empty.", nameof(xml));
@@ -367,7 +368,24 @@ namespace NetUtils {
 				RaisSqlEvent($"Error: {ex.Message}", SqlEvents.Exception, LogLevel.Error, true);
 			}
 		}
-		public async Task UpdateRecordAsync(DataTable dataTable, string schemaName = "sfo") {
+		public enum enmIsTo {
+			Insert,
+			Update,
+			Delete,
+		}
+		public async Task UpdateOrInsertRecordAsync(DataTable dataTable, string recordId, enmIsTo isTo, string dBschemaName = "sfo") {// update the sql server if exist, insert otherwise
+			if (isTo == enmIsTo.Update) {
+				if (!AssertRecord(dataTable.TableName, dataTable.Rows[0]["Id"].ToString()!, dBschemaName)) {
+					DataTable dt = await _salesforceService.GetSalesforceRecord(dataTable.TableName, recordId);
+				await InsertRecordAsync(dt, dBschemaName);
+
+				}
+				
+			} else {
+				throw new Exception($"Record with Id {dataTable.Rows[0]["Id"]} does not exist in table {dataTable.TableName}.");
+			}
+
+	
 			if (dataTable == null || dataTable.Rows.Count == 0)
 				throw new ArgumentException("DataTable is empty or null.");
 			string tableName = dataTable.TableName;
@@ -392,7 +410,7 @@ namespace NetUtils {
 					var updateAssignments = string.Join(", ", validColumns
 						.Skip(1) // Skip primary key column for updates
 						.Select(c => $"{c.ColumnName} = @{c.ColumnName}"));
-					string sql = $"UPDATE {schemaName}.[{tableName}] SET {updateAssignments} WHERE {primaryKeyColumn.ColumnName} = @{primaryKeyColumn.ColumnName}";
+					string sql = $"UPDATE {dBschemaName}.[{tableName}] SET {updateAssignments} WHERE {primaryKeyColumn.ColumnName} = @{primaryKeyColumn.ColumnName}";
 					using (var command = new SqlCommand(sql, connection)) {
 						AddParametersToCommand(command, validColumns, row, dtColumns);
 						int rowsAffected = await command.ExecuteNonQueryAsync();
@@ -400,12 +418,14 @@ namespace NetUtils {
 							throw new Exception("No records were updated. Record not found or data unchanged.");
 					}
 				}
+
 			} catch (SqlException ex) {
 				throw new Exception($"SQL Server error during update: {ex.Message}", ex);
 			} catch (Exception ex) {
 				throw new Exception($"Error updating record in SQL Server: {ex.Message}", ex);
 			}
 		}
+
 		public async Task InsertRecordAsync(DataTable dataTable, string schemaName = "sfo") {
 			if (dataTable == null || dataTable.Rows.Count == 0) throw new ArgumentException("DataTable is empty or null.");
 			string tableName = dataTable.TableName;
@@ -436,7 +456,7 @@ namespace NetUtils {
 			} catch (SqlException ex) {
 				throw new Exception($"SQL Server error during insert: {ex.Message}\r\n{ex.StackTrace}", ex);
 			} catch (Exception ex) {
-				throw new Exception($"Error inserting record into SQL Server: {ex.Message}", ex);
+				throw new Exception($"Error inserting record into SQL Server: {ex.Message}", gex);
 			}
 		}
 		#region helpers (private)
@@ -449,7 +469,8 @@ namespace NetUtils {
 				object value = row[dtColName];
 
 				// Handle null values
-				if (value == null || value == DBNull.Value) {
+	
+				if (value == null || value == DBNull.Value || value.Equals(string.Empty)) {
 					if (!col.IsNullable)
 						throw new Exception($"Column {col.ColumnName} is not nullable but received a null value.");
 					command.Parameters.Add(new SqlParameter($"@{col.ColumnName}", SqlDbType.NVarChar) { Value = DBNull.Value });
@@ -536,7 +557,6 @@ namespace NetUtils {
 				// Console.WriteLine($"Parameter @{col.ColumnName}: {command.Parameters[$"@{col.ColumnName}"].Value}");
 			}
 		}
-
 		private async Task<DataTable> getTableSchemaAsync(SqlConnection connection, string tableName) {
 			var schemaTable = new DataTable();
 			string sql = "SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE FROM dbo.ftSfoSchema(@TableName)";
@@ -558,7 +578,7 @@ namespace NetUtils {
 				"int" => "INT",
 				"long" => "BIGINT",
 				"double" => "FLOAT",
-				"currency" => "DECIMAL(18,2)",
+				"currency" => "MONEY",
 				"date" => "DATE",
 				"datetime" => "DATETIME",
 				"textarea" => "TEXT",
@@ -722,7 +742,7 @@ public static class SqlServerLibExtensions {
 		return ds.GetXml();
 	}
 
-	
+
 	public static DataTable Transpose(this DataTable inputTable, string rowLabel = "FieldName", string contentLabel = "Value", string primaryKey = null) {
 		if (inputTable == null || inputTable.Rows.Count == 0)
 			return new DataTable();
@@ -733,10 +753,10 @@ public static class SqlServerLibExtensions {
 			.ToList()
 			.ForEach(fieldName => transposedTable.Columns.Add(fieldName));
 		var rowData = inputTable.AsEnumerable()     // Project rows to key-value pairs with DateTime conversion
-					.Select(row => new {	
-							FieldName = row[rowLabel]?.ToString(),
-							FieldValue = inputTable.Columns.Contains("DataType") && row["DataType"]?.ToString() == "DateTime" && long.TryParse(row[contentLabel]?.ToString(), out long longValue)? ConvertLongToDateTime(longValue)	: row[contentLabel]?.ToString()
-						   })
+					.Select(row => new {
+						FieldName = row[rowLabel]?.ToString(),
+						FieldValue = inputTable.Columns.Contains("DataType") && row["DataType"]?.ToString() == "DateTime" && long.TryParse(row[contentLabel]?.ToString(), out long longValue) ? ConvertLongToDateTime(longValue) : row[contentLabel]?.ToString()
+					})
 							.Where(x => !string.IsNullOrEmpty(x.FieldName) && transposedTable.Columns.Contains(x.FieldName)).ToList();
 		DataRow newRow = transposedTable.NewRow();// Create and populate a new row
 		rowData.ForEach(x => newRow[x.FieldName] = x.FieldValue != null ? (object)x.FieldValue : DBNull.Value);
