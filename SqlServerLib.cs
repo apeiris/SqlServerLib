@@ -308,7 +308,6 @@ namespace NetUtils {
 					}
 				}
 			}
-
 		private string columnList(DataTable dt) {
 			string cList = string.Join(",", dt.Columns.Cast<DataColumn>()
 			.Select(col => $"[{col.ColumnName}]"));
