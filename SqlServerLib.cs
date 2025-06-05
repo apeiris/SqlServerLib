@@ -12,7 +12,7 @@ namespace NetUtils {
 	#region enums
 	public enum SqlEvents {
 		None,
-		Created,
+		Create,
 		Inserted,
 		Deleted,
 		Updated,
@@ -94,9 +94,18 @@ namespace NetUtils {
 		private void _pubSubService_CDCEvent(object? sender, CDCEventArgs e) {
 			DataTable dtTransposed = e.DeltaFields.Transpose(primaryKey: "Id");//Transpose to row to columnset, and  defaults  FieldName, and Value as columns
 			string sql = $"SELECT  {columnList(dtTransposed)} FROM sfo.[{dtTransposed.TableName}] where {dtTransposed.PrimaryKey.FirstOrDefault()?.ColumnName}='{e.RecordIds[0]}';";
-			//UpdateServerTable(dtTransposed, sql);
+
 			enmIsTo isto = (enmIsTo)Enum.Parse(typeof(enmIsTo), e.ChangeType, ignoreCase: true);
-			UpdateOrInsertRecordAsync(dtTransposed, e.RecordIds[0], isto);
+			switch (isto) {
+				case enmIsTo.Insert:
+				case enmIsTo.Create:
+				case enmIsTo.Update:
+					UpdateOrInsertRecordAsync(dtTransposed, e.RecordIds[0], isto);
+					break;
+				case enmIsTo.Delete:
+					int rowsAffected = DeleteRecord(e.DeltaFields.TableName, e.RecordIds[0]);
+					break;
+				}
 			}
 		#endregion SqlServerLib.ctor
 		#region Public Methods
@@ -294,25 +303,30 @@ namespace NetUtils {
 					}
 				}
 			}
-		public int ExececuteScalar(string selectStmt) {
+		public int ExececuteScalar(string query) {
 			using (SqlConnection conn = new SqlConnection(_connectionString)) {
 				conn.Open();
 				try {
-					using (SqlCommand cmd = new SqlCommand(selectStmt)) {
+					using (SqlCommand cmd = new SqlCommand(query)) {
 						int count = (int)cmd.ExecuteScalar();
 						return count;
 						}
 					} catch (Exception ex) {
-					RaisSqlEvent($"Error executing SQL:{selectStmt}  Error:{ex.Message}", SqlEvents.Exception, LogLevel.Error, hasErrors: true);
+					RaisSqlEvent($"Error executing SQL:{query}  Error:{ex.Message}", SqlEvents.Exception, LogLevel.Error, hasErrors: true);
 					throw;
 					}
 				}
+			}
+		public int DeleteRecord(string tableName, string recordId) {
+			string stmt = $"DELETE FROM sfo.[{tableName}] WHERE Id = '{recordId}'";
+			return ExecuteNoneQuery(stmt);
 			}
 		private string columnList(DataTable dt) {
 			string cList = string.Join(",", dt.Columns.Cast<DataColumn>()
 			.Select(col => $"[{col.ColumnName}]"));
 			return cList;
 			}
+
 		public void UpdateServerTable(DataTable modifiedTable, string schemaSelect) {
 			try {
 				using (SqlConnection conn = new SqlConnection(_connectionString)) {
@@ -332,15 +346,21 @@ namespace NetUtils {
 			Insert,
 			Update,
 			Delete,
+			Create
 			}
 		public async Task UpdateOrInsertRecordAsync(DataTable dataTable, string recordId, enmIsTo isTo, string dBschemaName = "sfo") {// update the sql server if exist, insert otherwise
-			if (isTo == enmIsTo.Update) {
-				if (!AssertRecord(dataTable.TableName, dataTable.Rows[0]["Id"].ToString()!, dBschemaName)) {
-					DataTable dt = await _salesforceService.GetSalesforceRecord(dataTable.TableName, recordId);
-					await InsertRecordAsync(dt, dBschemaName);
-					}
-				} else {
-				throw new Exception($"Record with Id {dataTable.Rows[0]["Id"]} does not exist in table {dataTable.TableName}.");
+			switch (isTo) {
+				case enmIsTo.Update:
+				case enmIsTo.Create:
+					if (!AssertRecord(dataTable.TableName, dataTable.Rows[0]["Id"]?.ToString() ?? throw new InvalidOperationException("Record ID is null"), dBschemaName)) {
+						DataTable dt = await _salesforceService.GetSalesforceRecord(dataTable.TableName, recordId);
+						await InsertRecordAsync(dt, dBschemaName);
+						return;
+						}
+					break;
+
+				default:
+					throw new InvalidOperationException($"Record with Id {dataTable.Rows[0]["Id"]} does not exist in table {dataTable.TableName}.");
 				}
 			if (dataTable == null || dataTable.Rows.Count == 0) throw new ArgumentException("DataTable is empty or null.");
 			string tableName = dataTable.TableName;
@@ -728,40 +748,78 @@ public static class SqlServerLibExtensions {
 			return longValue.ToString();
 			}
 		}
-	public static string ToJson(this DataTable table, bool indented = false, string excludedColumns="") {
+	public static string ToJson(this DataTable table, bool indented = false, string excludedColumns = "", bool singleObject = true) {
+		// Handle empty DataTable
+		if (table == null || table.Rows.Count == 0) {
+			return JsonSerializer.Serialize(new Dictionary<string, object>(), new JsonSerializerOptions {
+				WriteIndented = indented,
+				PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+				});
+			}
+
 		var excludeColumns = string.IsNullOrWhiteSpace(excludedColumns)
 			? new HashSet<string>()
-			: new HashSet<string>(excludedColumns.Split(',').Select(col => col.Trim()), StringComparer.OrdinalIgnoreCase);
-		var rows = table.Rows
-			.Cast<DataRow>()
-			.Select(row => table.Columns
-				.Cast<DataColumn>()
-				.Where(col => !excludeColumns.Contains(col.ColumnName))
+			: new HashSet<string>(excludedColumns.Split(',', StringSplitOptions.RemoveEmptyEntries)
+												.Select(col => col.Trim()), StringComparer.OrdinalIgnoreCase);
+
+		// Identify columns with at least one non-null value (optional, based on your previous request)
+		var validColumns = table.Columns.Cast<DataColumn>()
+			.Where(col => !excludeColumns.Contains(col.ColumnName) &&
+						  table.AsEnumerable().Any(row => !row.IsNull(col)))
+			.Select(col => col.ColumnName)
+			.ToHashSet();
+
+		// Serialize a single object if singleObject is true (for UpsertSobject)
+		if (singleObject) {
+			var row = table.Rows[0]; // Take first row for single-object JSON
+			var dict = table.Columns.Cast<DataColumn>()
+				.Where(col => validColumns.Contains(col.ColumnName))
 				.ToDictionary(
 					col => col.ColumnName,
-					col => row[col] == DBNull.Value ? null : row[col] // Handle DBNull
+					col => row.IsNull(col) ? null : row[col]
+				);
+
+			return JsonSerializer.Serialize(dict, new JsonSerializerOptions {
+				WriteIndented = indented,
+				PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+				});
+			}
+
+		// Serialize all rows as an array (for other use cases)
+		var rows = table.Rows.Cast<DataRow>()
+			.Select(row => table.Columns.Cast<DataColumn>()
+				.Where(col => validColumns.Contains(col.ColumnName))
+				.ToDictionary(
+					col => col.ColumnName,
+					col => row.IsNull(col) ? null : row[col]
 				));
+
 		return JsonSerializer.Serialize(rows, new JsonSerializerOptions {
 			WriteIndented = indented,
-			PropertyNamingPolicy = JsonNamingPolicy.CamelCase// Salesfore requirement
+			PropertyNamingPolicy = JsonNamingPolicy.CamelCase
 			});
 		}
 	//==========================================================================================
-	public static string ToJson(this DataRow row, bool indented = false, string excludedColumns = "" ) {
-		var excludeColumns = string.IsNullOrWhiteSpace(excludedColumns)
-			? new HashSet<string>()
-			: new HashSet<string>(excludedColumns.Split(',').Select(col => col.Trim()), StringComparer.OrdinalIgnoreCase);
-		var rowDict = row.Table.Columns// Create dictionary for the row, excluding specified columns
-			.Cast<DataColumn>()
-			.Where(col => !excludeColumns.Contains(col.ColumnName))
-			.ToDictionary(
-				col => col.ColumnName,
-				col => row[col] == DBNull.Value ? null : row[col]
-			);
-		return JsonSerializer.Serialize(rowDict, new JsonSerializerOptions {// Serialize to JSON with camelCase and optional indentation
+	public static string ToJson(this DataRow row, bool indented = false, string excludedColumns = "") {
+		var dict = new Dictionary<string, object>();
+		var excluded = excludedColumns.Split(',', StringSplitOptions.RemoveEmptyEntries)
+									 .Select(c => c.Trim())
+									 .ToHashSet();
+
+		foreach (DataColumn column in row.Table.Columns) {
+			if (!excluded.Contains(column.ColumnName)) {
+				dict[column.ColumnName] = row.IsNull(column) ? null : row[column];
+				}
+			}
+
+		var options = new JsonSerializerOptions {
+			PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
 			WriteIndented = indented,
-			PropertyNamingPolicy = JsonNamingPolicy.CamelCase // Salesforce require camelCase
-			});
+			DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+			};
+
+		return JsonSerializer.Serialize(dict, options); // Serializes as object, not array
 		}
+
 	}
 #endregion Extensions
