@@ -2,10 +2,12 @@
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using DocumentFormat.OpenXml.Wordprocessing;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
+using NetUtils;
 using Newtonsoft.Json.Serialization;
 namespace NetUtils {
 	public class SqlServerConfig { public string ConnectionString { get; set; } }
@@ -398,6 +400,12 @@ namespace NetUtils {
 				throw new Exception($"Error updating record in SQL Server: {ex.Message}", ex);
 				}
 			}
+		//public static string GetObjectNameFromEventDeclaration(string eventDeclaration) {
+		//	return Regex.Replace(eventDeclaration, @"(__)?ChangeEvent$", m => m.Groups[1].Success ? "__c" : "");
+
+		//	}
+		
+
 		public async Task InsertRecordAsync(DataTable dataTable, string schemaName = "sfo") {
 			if (dataTable == null || dataTable.Rows.Count == 0) throw new ArgumentException("DataTable is empty or null.");
 			string tableName = dataTable.TableName;
@@ -572,6 +580,9 @@ namespace NetUtils {
 			}
 		#endregion helpers (private)
 		}
+
+
+
 	#endregion	Public Methods
 	}
 #region Extensions
@@ -821,5 +832,29 @@ public static class SqlServerLibExtensions {
 		return JsonSerializer.Serialize(dict, options); // Serializes as object, not array
 		}
 
+
+
+
+	public static DataTable DeriveColumn(this DataTable inputTable, string deriveFromColumn, string newColumnName) {
+		/*selectedEntity					(ObjectName)   From PlatformEventChannelMember
+			AccountChangeEvent				Account
+			Order_Item__ChangeEvent			Order_Item__c
+			Order__ChangeEvent				Order__c
+			Product_Family__ChangeEvent		Product_Family__c
+			Product__ChangeEvent			Product__c
+			
+		 */
+		inputTable.Columns.Add(newColumnName, typeof(string));
+		inputTable.AsEnumerable()
+			.Select((row, index) => {
+				string selectedEntity = row[deriveFromColumn]?.ToString();
+				object derivedValue = DBNull.Value;
+				row[newColumnName] = SalesforceService.PlatformEventChannelMemeberToObjectName(selectedEntity);
+				return row; // Required by Select, though not used as rows are modified in-place
+			})
+			.ToList();
+		inputTable.Columns.Remove(deriveFromColumn);
+		return inputTable;
+		}
 	}
 #endregion Extensions
