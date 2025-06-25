@@ -836,7 +836,7 @@ public static class SqlServerLibExtensions {
 
 
 	public static DataTable DeriveColumn(this DataTable inputTable, string deriveFromColumn, string newColumnName) {
-		/*selectedEntity					(ObjectName)   From PlatformEventChannelMember
+		/*selectedEntity					(ObjectName)         From PlatformEventChannelMember
 			AccountChangeEvent				Account
 			Order_Item__ChangeEvent			Order_Item__c
 			Order__ChangeEvent				Order__c
@@ -853,7 +853,7 @@ public static class SqlServerLibExtensions {
 				return row; // Required by Select, though not used as rows are modified in-place
 			})
 			.ToList();
-		inputTable.Columns.Remove(deriveFromColumn);
+		if(inputTable.Columns.Contains(deriveFromColumn)) 	inputTable.Columns.Remove(deriveFromColumn);
 		return inputTable;
 		}
 	}
